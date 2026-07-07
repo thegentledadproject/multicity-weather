@@ -1,0 +1,19 @@
+[Unit]
+Description=Hermes Dashboard API
+After=network-online.target hermes.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hermes
+WorkingDirectory=/opt/hermes
+EnvironmentFile=/opt/hermes/.env
+ExecStart=/opt/hermes/venv/bin/uvicorn dashboard_api:app --host 0.0.0.0 --port 8000
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hermes-dashboard
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,19 @@
+[Unit]
+Description=Hermes WSSS Weather Bracket Trader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hermes
+WorkingDirectory=/opt/hermes
+EnvironmentFile=/opt/hermes/.env
+ExecStart=/opt/hermes/venv/bin/python scheduler.py
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hermes
+
+[Install]
+WantedBy=multi-user.target

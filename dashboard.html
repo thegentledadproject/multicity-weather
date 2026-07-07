@@ -1,0 +1,686 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hermes v4.5 — WSSS Weather Arb</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  /* ── Tokens ── */
+  :root {
+    --bg:      #0d1117;
+    --surf:    #161b22;
+    --border:  #21262d;
+    --amber:   #f59e0b;
+    --teal:    #22d3ee;
+    --green:   #22c55e;
+    --red:     #ef4444;
+    --muted:   #6e7681;
+    --text:    #e6edf3;
+    --font-mono: "JetBrains Mono", "Fira Code", "Cascadia Code", monospace;
+    --font-sans: "Inter", system-ui, sans-serif;
+    --radius:  8px;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-sans);
+    font-size: 13px;
+    line-height: 1.6;
+    min-height: 100vh;
+  }
+
+  /* ── Layout ── */
+  .shell      { max-width: 1440px; margin: 0 auto; padding: 0 24px 48px; }
+  .header     { display: flex; align-items: center; justify-content: space-between;
+                padding: 20px 0 16px; border-bottom: 1px solid var(--border); }
+  .header-left .eyebrow { font-size: 10px; letter-spacing: 3px;
+                           text-transform: uppercase; color: var(--amber); }
+  .header-left h1 { font-size: 22px; font-weight: 700; margin-top: 4px;
+                     letter-spacing: -0.3px; }
+  .header-right   { display: flex; align-items: center; gap: 12px; }
+  .clock          { font-family: var(--font-mono); font-size: 11px;
+                    color: var(--muted); text-align: right; }
+  .btn-refresh    { background: var(--surf); border: 1px solid var(--border);
+                    color: var(--text); padding: 6px 14px; border-radius: var(--radius);
+                    cursor: pointer; font-size: 11px; letter-spacing: 1px;
+                    transition: border-color .15s; }
+  .btn-refresh:hover { border-color: var(--amber); color: var(--amber); }
+
+  .status-bar  { display: flex; align-items: center; gap: 8px;
+                 padding: 8px 0; font-size: 11px; color: var(--muted);
+                 border-bottom: 1px solid var(--border); margin-bottom: 20px; }
+  .status-dot  { width: 7px; height: 7px; border-radius: 50%;
+                 background: var(--muted); flex-shrink: 0; }
+  .status-dot.live { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .status-dot.mock { background: var(--amber); }
+
+  /* ── KPI row ── */
+  .kpi-row   { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px;
+               margin-bottom: 24px; }
+  .kpi-card  { background: var(--surf); border: 1px solid var(--border);
+               border-radius: var(--radius); padding: 14px 16px; }
+  .kpi-label { font-size: 9px; letter-spacing: 2px; text-transform: uppercase;
+               color: var(--muted); margin-bottom: 8px; }
+  .kpi-value { font-size: 24px; font-weight: 700; line-height: 1;
+               font-family: var(--font-mono); }
+  .kpi-sub   { font-size: 10px; color: var(--muted); margin-top: 6px; }
+  .positive  { color: var(--green); }
+  .negative  { color: var(--red); }
+  .amber     { color: var(--amber); }
+  .teal      { color: var(--teal); }
+
+  /* ── Chart grid ── */
+  .grid-2-1  { display: grid; grid-template-columns: 2fr 1fr; gap: 16px;
+               margin-bottom: 16px; }
+  .grid-3-2  { display: grid; grid-template-columns: 3fr 2fr; gap: 16px;
+               margin-bottom: 16px; }
+  .grid-2-1b { display: grid; grid-template-columns: 2fr 1fr; gap: 16px;
+               margin-bottom: 16px; }
+
+  .panel     { background: var(--surf); border: 1px solid var(--border);
+               border-radius: var(--radius); padding: 18px 20px; }
+  .panel-title { font-size: 11px; letter-spacing: 2px; text-transform: uppercase;
+                 color: var(--muted); margin-bottom: 14px; }
+
+  canvas     { max-height: 260px; }
+
+  /* ── Open positions ── */
+  .pos-card  { background: var(--bg); border: 1px solid var(--border);
+               border-radius: 6px; padding: 12px 14px; margin-bottom: 10px; }
+  .pos-top   { display: flex; justify-content: space-between; align-items: baseline; }
+  .pos-label { font-weight: 700; font-size: 14px; color: var(--amber); }
+  .pos-size  { font-family: var(--font-mono); font-size: 13px; }
+  .pos-row   { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .pos-trail { color: var(--teal); }
+  .pos-stop  { color: var(--red); }
+  .pos-empty { color: var(--muted); font-size: 12px; padding: 16px 0; }
+
+  /* ── Trade table ── */
+  .table-wrap { overflow-x: auto; }
+  table      { width: 100%; border-collapse: collapse; font-size: 11px; }
+  th         { font-size: 9px; letter-spacing: 1.5px; text-transform: uppercase;
+               color: var(--muted); text-align: left; padding: 6px 10px;
+               border-bottom: 1px solid var(--border); white-space: nowrap; }
+  td         { padding: 7px 10px; border-bottom: 1px solid var(--border);
+               font-family: var(--font-mono); white-space: nowrap; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td      { background: rgba(255,255,255,0.02); }
+
+  /* ── Misc ── */
+  .divider   { border: none; border-top: 1px solid var(--border);
+               margin: 20px 0; }
+  .section-title { font-size: 11px; letter-spacing: 2px; text-transform: uppercase;
+                   color: var(--text); font-weight: 600; margin-bottom: 14px; }
+  .footer    { font-size: 10px; color: var(--muted); text-align: center;
+               margin-top: 32px; line-height: 2; }
+  .badge     { display: inline-block; padding: 2px 7px; border-radius: 4px;
+               font-size: 10px; font-family: var(--font-mono); font-weight: 600; }
+  .badge-buy    { background: rgba(34,197,94,.15); color: var(--green); }
+  .badge-sell   { background: rgba(239,68,68,.15); color: var(--red); }
+  .badge-trail  { background: rgba(245,158,11,.15); color: var(--amber); }
+  .badge-stop   { background: rgba(239,68,68,.15); color: var(--red); }
+  .badge-time   { background: rgba(34,211,238,.15); color: var(--teal); }
+  .badge-pass   { background: rgba(34,197,94,.18);  color: var(--green); }
+  .badge-hold   { background: rgba(110,118,129,.20); color: var(--muted); }
+  .badge-gated  { background: rgba(245,158,11,.15); color: var(--amber); }
+  .row-pass td  { background: rgba(34,197,94,.04); }
+
+  @media (max-width: 900px) {
+    .kpi-row { grid-template-columns: repeat(3,1fr); }
+    .grid-2-1,.grid-3-2,.grid-2-1b { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 560px) {
+    .kpi-row { grid-template-columns: repeat(2,1fr); }
+  }
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <!-- Header -->
+  <div class="header">
+    <div class="header-left">
+      <div class="eyebrow">Hermes v4.5</div>
+      <h1>WSSS Weather Bracket Arb <span style="color:var(--muted);font-weight:400;font-size:16px">· Live Dashboard</span></h1>
+    </div>
+    <div class="header-right">
+      <div class="clock" id="clock">—</div>
+      <button class="btn-refresh" onclick="refresh()">⟳ Refresh</button>
+    </div>
+  </div>
+
+  <!-- Status bar -->
+  <div class="status-bar">
+    <span class="status-dot" id="status-dot"></span>
+    <span id="status-text">Connecting…</span>
+    <span style="margin-left:auto" id="last-updated"></span>
+  </div>
+
+  <!-- KPI Row -->
+  <div class="kpi-row">
+    <div class="kpi-card">
+      <div class="kpi-label">Vault Balance</div>
+      <div class="kpi-value amber" id="kpi-vault">—</div>
+      <div class="kpi-sub" id="kpi-pnl">—</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">ROI</div>
+      <div class="kpi-value" id="kpi-roi">—</div>
+      <div class="kpi-sub" id="kpi-roi-sub">—</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Win Rate</div>
+      <div class="kpi-value" id="kpi-winrate">—</div>
+      <div class="kpi-sub" id="kpi-wl">—</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Trailing Bias</div>
+      <div class="kpi-value teal" id="kpi-bias">—</div>
+      <div class="kpi-sub" id="kpi-mae">—</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Avg Edge</div>
+      <div class="kpi-value" id="kpi-edge">—</div>
+      <div class="kpi-sub" id="kpi-signals">—</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Open Positions</div>
+      <div class="kpi-value amber" id="kpi-open">—</div>
+      <div class="kpi-sub">active brackets</div>
+    </div>
+  </div>
+
+  <!-- Row 1: Equity + Exit reasons -->
+  <div class="grid-2-1">
+    <div class="panel">
+      <div class="panel-title">Vault equity curve</div>
+      <canvas id="chart-equity"></canvas>
+    </div>
+    <div class="panel">
+      <div class="panel-title">Exit reason breakdown</div>
+      <canvas id="chart-reasons"></canvas>
+    </div>
+  </div>
+
+  <!-- Signal scan funnel (full breakdown) -->
+  <div class="panel" style="margin-bottom:16px">
+    <div class="panel-title">Signal scan funnel — every bracket every cycle</div>
+    <div id="signal-funnel" style="display:flex;gap:8px;flex-wrap:wrap;align-items:stretch"></div>
+  </div>
+
+  <!-- Latest scan — live per-bracket status this cycle -->
+  <div class="panel" style="margin-bottom:16px">
+    <div class="panel-title">
+      Latest scan — all brackets this cycle
+      <span id="scan-summary" style="color:var(--muted);font-weight:400;text-transform:none;letter-spacing:0;margin-left:8px"></span>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Bracket</th><th>Model</th><th>Market</th><th>Edge</th>
+            <th>Status</th><th>Reason</th>
+          </tr>
+        </thead>
+        <tbody id="scan-tbody">
+          <tr><td colspan="6" style="color:var(--muted);text-align:center;padding:16px">Waiting for first scan…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Row 2: Edge history + P&L by bracket -->
+  <div class="grid-3-2">
+    <div class="panel">
+      <div class="panel-title">Edge scan — model vs market probability</div>
+      <canvas id="chart-edge"></canvas>
+    </div>
+    <div class="panel">
+      <div class="panel-title">P&L by bracket &amp; direction</div>
+      <canvas id="chart-pnl"></canvas>
+    </div>
+  </div>
+
+  <!-- Row 3: Calibration + Open positions -->
+  <div class="grid-2-1b">
+    <div class="panel">
+      <div class="panel-title">GFS/ECMWF calibration — residuals (actual − model μ)</div>
+      <canvas id="chart-calib"></canvas>
+    </div>
+    <div class="panel">
+      <div class="panel-title">Open positions</div>
+      <div id="positions-container"><div class="pos-empty">No open positions.</div></div>
+    </div>
+  </div>
+
+  <!-- Trade history -->
+  <hr class="divider">
+  <div class="section-title">Trade history</div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Closed (SGT)</th><th>Bracket</th><th>Dir</th><th>Exit Reason</th>
+          <th>Entry</th><th>Exit</th><th>Size</th><th>P&amp;L</th>
+        </tr>
+      </thead>
+      <tbody id="trades-tbody"><tr><td colspan="8" style="color:var(--muted);text-align:center;padding:20px">No trades yet.</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="footer">
+    Hermes v4.5 · WSSS Changi Airport · GFS+ECMWF blend · Trailing stop 20% · Edge threshold 5%
+    <br>Refreshes every 30 seconds · <span id="footer-mode">—</span>
+  </div>
+</div>
+
+<script>
+const API = window.location.origin;
+const CHART_OPTS = { responsive: true, maintainAspectRatio: false };
+const BG = "#0d1117", SURF = "#161b22", BORDER = "#21262d";
+const AMBER = "#f59e0b", TEAL = "#22d3ee", GREEN = "#22c55e", RED = "#ef4444", MUTED = "#6e7681";
+
+let charts = {};
+
+// ── Clock ─────────────────────────────────────────────────────────────────────
+function updateClock() {
+  const sgt = new Date(Date.now() + 8 * 3600000);
+  document.getElementById("clock").textContent =
+    sgt.toISOString().replace("T", " ").slice(0, 16) + " SGT";
+}
+setInterval(updateClock, 1000);
+updateClock();
+
+// ── Chart factory ─────────────────────────────────────────────────────────────
+function mkChart(id, type, data, opts = {}) {
+  if (charts[id]) charts[id].destroy();
+  const ctx = document.getElementById(id).getContext("2d");
+  charts[id] = new Chart(ctx, {
+    type, data,
+    options: {
+      ...CHART_OPTS,
+      plugins: { legend: { display: false }, tooltip: { mode: "index", intersect: false } },
+      scales: {
+        x: { grid: { color: BORDER }, ticks: { color: MUTED, font: { size: 10 } } },
+        y: { grid: { color: BORDER }, ticks: { color: MUTED, font: { size: 10 } } },
+      },
+      ...opts,
+    },
+  });
+}
+
+// ── Fetch wrapper ──────────────────────────────────────────────────────────────
+async function api(path) {
+  const r = await fetch(API + path);
+  if (!r.ok) throw new Error(r.status);
+  return r.json();
+}
+
+// ── Renderers ─────────────────────────────────────────────────────────────────
+function renderKPIs(d) {
+  const pnl = d.net_pnl;
+  const roi = d.roi_pct;
+  document.getElementById("kpi-vault").textContent = "$" + d.vault_current.toFixed(2);
+  const pnlEl = document.getElementById("kpi-pnl");
+  pnlEl.textContent = (pnl >= 0 ? "+" : "") + "$" + pnl.toFixed(4) + " net P&L";
+  pnlEl.className = "kpi-sub " + (pnl >= 0 ? "positive" : "negative");
+  const roiEl = document.getElementById("kpi-roi");
+  roiEl.textContent = (roi >= 0 ? "+" : "") + roi.toFixed(1) + "%";
+  roiEl.className = "kpi-value " + (roi >= 0 ? "positive" : "negative");
+  document.getElementById("kpi-roi-sub").textContent = "from $" + d.vault_start.toFixed(0) + " start";
+  const wrEl = document.getElementById("kpi-winrate");
+  wrEl.textContent = d.win_rate_pct.toFixed(1) + "%";
+  wrEl.className = "kpi-value " + (d.win_rate_pct >= 50 ? "positive" : "amber");
+  document.getElementById("kpi-wl").textContent = d.wins + "W / " + d.losses + "L";
+  const biasEl = document.getElementById("kpi-bias");
+  biasEl.textContent = (d.trailing_bias >= 0 ? "+" : "") + d.trailing_bias.toFixed(3) + "°C";
+  biasEl.className = "kpi-value " + (Math.abs(d.trailing_bias) < 0.5 ? "teal" : "amber");
+  document.getElementById("kpi-mae").textContent =
+    "MAE " + d.mae_celsius.toFixed(3) + "°C · " + d.n_calibrations + " obs";
+  document.getElementById("kpi-edge").textContent = d.avg_edge_pct.toFixed(1) + "%";
+  document.getElementById("kpi-signals").textContent = d.actionable_signals + " signals";
+  document.getElementById("kpi-open").textContent = d.open_positions;
+}
+
+function renderEquity(d) {
+  if (!d.trades.length) return;
+  const labels = d.trades.map((t, i) => "#" + (i + 1));
+  const vaults  = d.trades.map(t => t.vault);
+  const colors  = d.trades.map(t => t.realised_pnl >= 0 ? GREEN : RED);
+  mkChart("chart-equity", "line", {
+    labels,
+    datasets: [{
+      label: "Vault", data: vaults,
+      borderColor: AMBER, borderWidth: 2.5,
+      pointBackgroundColor: colors, pointRadius: 5,
+      pointHoverRadius: 7, fill: false, tension: 0.2,
+    }],
+  }, {
+    scales: {
+      x: { grid: { color: BORDER }, ticks: { color: MUTED, font: { size: 10 } } },
+      y: {
+        grid: { color: BORDER }, ticks: { color: MUTED, font: { size: 10 },
+          callback: v => "$" + v.toFixed(0)
+        },
+      },
+    },
+    plugins: {
+      legend: { display: false },
+      annotation: { annotations: [{
+        type: "line", yMin: d.vault_start, yMax: d.vault_start,
+        borderColor: MUTED, borderWidth: 1, borderDash: [6, 3],
+      }]},
+    },
+  });
+}
+
+function renderReasons(d) {
+  if (!d.reasons.length) return;
+  const COLOR_MAP = { TRAILING_STOP: AMBER, STOP_LOSS: RED, TIME_EXIT: TEAL };
+  mkChart("chart-reasons", "doughnut", {
+    labels: d.reasons.map(r => r.reason),
+    datasets: [{
+      data:            d.reasons.map(r => r.count),
+      backgroundColor: d.reasons.map(r => COLOR_MAP[r.reason] || MUTED),
+      borderColor:     SURF,
+      borderWidth:     2,
+      hoverOffset:     6,
+    }],
+  }, {
+    cutout: "55%",
+    plugins: {
+      legend: {
+        display: true, position: "bottom",
+        labels: { color: MUTED, font: { size: 10 }, padding: 12, boxWidth: 10 },
+      },
+    },
+    scales: { x: { display: false }, y: { display: false } },
+  });
+}
+
+function renderEdge(d) {
+  if (!d.signals.length) return;
+  const last = d.signals.slice(-60);
+  const labels = last.map((s, i) => i + 1);
+  mkChart("chart-edge", "line", {
+    labels,
+    datasets: [
+      {
+        label: "Model %", data: last.map(s => +(s.model_prob * 100).toFixed(2)),
+        borderColor: AMBER, borderWidth: 1.5, fill: false,
+        pointRadius: 2, tension: 0.2,
+      },
+      {
+        label: "Market %", data: last.map(s => +(s.market_price * 100).toFixed(2)),
+        borderColor: TEAL, borderWidth: 1.5, fill: false,
+        pointRadius: 2, tension: 0.2,
+      },
+    ],
+  }, {
+    plugins: {
+      legend: {
+        display: true, position: "top",
+        labels: { color: MUTED, font: { size: 10 }, padding: 10, boxWidth: 12 },
+      },
+    },
+    scales: {
+      x: { display: false },
+      y: {
+        grid: { color: BORDER },
+        ticks: { color: MUTED, font: { size: 10 }, callback: v => v + "%" },
+      },
+    },
+  });
+}
+
+function renderPnlByBracket(d) {
+  if (!d.groups.length) return;
+  const labels = d.groups.map(g => g.bracket_label + " " + g.direction);
+  const values = d.groups.map(g => +g.total_pnl.toFixed(4));
+  const colors = values.map(v => v >= 0 ? GREEN : RED);
+  mkChart("chart-pnl", "bar", {
+    labels,
+    datasets: [{ label: "P&L", data: values, backgroundColor: colors, borderRadius: 4 }],
+  }, {
+    scales: {
+      x: { grid: { display: false }, ticks: { color: MUTED, font: { size: 10 }, maxRotation: 30 } },
+      y: {
+        grid: { color: BORDER },
+        ticks: { color: MUTED, font: { size: 10 }, callback: v => "$" + v.toFixed(2) },
+      },
+    },
+  });
+}
+
+function renderCalib(d) {
+  if (!d.calibrations.length) return;
+  const labels = d.calibrations.map((_, i) => "#" + (i + 1));
+  const resids = d.calibrations.map(c => +c.residual.toFixed(3));
+  const biases = d.calibrations.map(c => +c.trailing_bias.toFixed(4));
+  mkChart("chart-calib", "bar", {
+    labels,
+    datasets: [
+      {
+        label: "Residual",
+        data: resids,
+        backgroundColor: resids.map(r => r >= 0 ? GREEN + "99" : RED + "99"),
+        borderColor:     resids.map(r => r >= 0 ? GREEN : RED),
+        borderWidth: 1, borderRadius: 3, order: 2,
+      },
+      {
+        label: "Trailing bias",
+        type: "line", data: biases,
+        borderColor: AMBER, borderWidth: 2, borderDash: [5,3],
+        pointRadius: 0, fill: false, tension: 0.3, order: 1,
+      },
+    ],
+  }, {
+    plugins: {
+      legend: {
+        display: true, position: "top",
+        labels: { color: MUTED, font: { size: 10 }, padding: 10, boxWidth: 12 },
+      },
+    },
+    scales: {
+      x: { grid: { display: false }, ticks: { color: MUTED, font: { size: 10 } } },
+      y: {
+        grid: { color: BORDER },
+        ticks: { color: MUTED, font: { size: 10 }, callback: v => v.toFixed(2) + "°" },
+      },
+    },
+  });
+}
+
+function renderPositions(d) {
+  const el = document.getElementById("positions-container");
+  if (!d.positions.length) {
+    el.innerHTML = '<div class="pos-empty">No open positions.</div>';
+    return;
+  }
+  el.innerHTML = d.positions.map(p => {
+    const label    = p.bracket_label;
+    const bracket  = label.split(":")[0];
+    const dir      = p.direction;
+    const entry    = +p.entry_price;
+    const peak     = +(p.peak_price || entry);
+    const size     = +p.size_usd;
+    const armed    = p.trail_armed;
+    const trail    = p.trail_level;
+    const stop     = p.stop_level;
+    const hours    = p.hold_hours;
+    const trailStr = armed && trail
+      ? `Trail: ${trail.toFixed(4)}` : "Trail: arming…";
+    return `
+<div class="pos-card">
+  <div class="pos-top">
+    <span class="pos-label">${bracket} · ${dir}</span>
+    <span class="pos-size">$${size.toFixed(2)}</span>
+  </div>
+  <div class="pos-row">Entry ${entry.toFixed(4)} · Peak ${peak.toFixed(4)} · ${hours}h open</div>
+  <div class="pos-row pos-trail">${trailStr}</div>
+  <div class="pos-row pos-stop">Stop: ${stop ? stop.toFixed(4) : "—"}</div>
+</div>`;
+  }).join("");
+}
+
+function renderTrades(d) {
+  const tbody = document.getElementById("trades-tbody");
+  if (!d.trades.length) {
+    tbody.innerHTML = '<tr><td colspan="8" style="color:var(--muted);text-align:center;padding:20px">No trades yet.</td></tr>';
+    return;
+  }
+  const REASON_CLS = { TRAILING_STOP: "badge-trail", STOP_LOSS: "badge-stop", TIME_EXIT: "badge-time" };
+  const DIR_CLS    = { BUY: "badge-buy", SELL: "badge-sell" };
+  tbody.innerHTML = d.trades.map(t => {
+    const pnl   = +t.realised_pnl;
+    const pnlCl = pnl >= 0 ? "positive" : "negative";
+    const closed = (t.closed_at || "").slice(0, 16);
+    const exit   = t.exit_price != null ? (+t.exit_price).toFixed(4) : "—";
+    return `<tr>
+      <td>${closed}</td>
+      <td>${t.bracket_label}</td>
+      <td><span class="badge ${DIR_CLS[t.direction] || ''}">${t.direction}</span></td>
+      <td><span class="badge ${REASON_CLS[t.reason] || ''}">${t.reason}</span></td>
+      <td>${(+t.entry_price).toFixed(4)}</td>
+      <td>${exit}</td>
+      <td>$${(+t.size_usd).toFixed(2)}</td>
+      <td class="${pnlCl}">${pnl >= 0 ? "+" : ""}$${pnl.toFixed(4)}</td>
+    </tr>`;
+  }).join("");
+}
+
+// ── Signal funnel renderer ───────────────────────────────────────────────────
+function renderSignalFunnel(d) {
+  const el = document.getElementById("signal-funnel");
+  if (!d.breakdown || !d.breakdown.length) {
+    el.innerHTML = '<div style="color:var(--muted);font-size:12px">No scan data yet.</div>';
+    return;
+  }
+
+  const COLOR = {
+    "SIGNAL_BUY":     GREEN,
+    "SIGNAL_SELL_NO": RED,
+    "HOLD_EDGE":      MUTED,
+    "SKIP_ILLIQUID":  "#374151",
+    "SKIP_SPREAD":    "#374151",
+    "NO_PRICE":       "#374151",
+  };
+  const total = d.breakdown.reduce((s, r) => s + r.count, 0);
+
+  el.innerHTML = d.breakdown.map(r => {
+    const color = COLOR[r.action] || MUTED;
+    const pct   = total > 0 ? (r.count / total * 100).toFixed(1) : "0.0";
+    const edge  = r.avg_abs_edge > 0 ? ` · avg |edge| ${(r.avg_abs_edge*100).toFixed(1)}%` : "";
+    return `
+<div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;
+            padding:12px 16px;min-width:160px;flex:1">
+  <div style="font-size:9px;letter-spacing:1.5px;text-transform:uppercase;
+              color:${color};margin-bottom:8px">${r.display_label}</div>
+  <div style="font-size:22px;font-weight:700;font-family:var(--font-mono);
+              color:${color};line-height:1">${r.count}</div>
+  <div style="font-size:10px;color:var(--muted);margin-top:5px">${pct}% of scans${edge}</div>
+  <div style="margin-top:8px;background:var(--border);border-radius:3px;height:3px">
+    <div style="background:${color};height:3px;border-radius:3px;
+                width:${pct}%;opacity:0.7"></div>
+  </div>
+</div>`;
+  }).join("");
+}
+
+
+// ── Latest scan table — all brackets this cycle ──────────────────────────────
+function renderLatestScan(d) {
+  const tbody   = document.getElementById("scan-tbody");
+  const summary = document.getElementById("scan-summary");
+  if (!d.scan || !d.scan.length) {
+    tbody.innerHTML = '<tr><td colspan="6" style="color:var(--muted);text-align:center;padding:16px">No scan data yet.</td></tr>';
+    summary.textContent = "";
+    return;
+  }
+
+  summary.textContent =
+    `${d.n_passed} passed · ${d.n_blocked} blocked · ${d.scan_date || ""}`;
+
+  const STATUS_BADGE = { PASS: "badge-pass", HOLD: "badge-hold", GATED: "badge-gated" };
+
+  tbody.innerHTML = d.scan.map(s => {
+    const edgeCls  = s.edge_pct >= 0 ? "positive" : "negative";
+    const rowCls   = s.passed ? "row-pass" : "";
+    const badgeCls = STATUS_BADGE[s.status] || "badge-hold";
+    const statusTxt = s.status === "PASS"
+      ? s.status_label            // "BUY YES" / "SELL NO"
+      : s.status;                 // "HOLD" / "GATED"
+    return `<tr class="${rowCls}">
+      <td style="font-weight:700">${s.bracket_label}</td>
+      <td>${s.model_pct.toFixed(1)}%</td>
+      <td>${s.market_pct.toFixed(1)}%</td>
+      <td class="${edgeCls}">${s.edge_pct >= 0 ? "+" : ""}${s.edge_pct.toFixed(1)}%</td>
+      <td><span class="badge ${badgeCls}">${statusTxt}</span></td>
+      <td style="color:var(--muted)">${s.passed ? "cleared edge gate" : s.status_label}</td>
+    </tr>`;
+  }).join("");
+}
+
+// ── Main refresh ──────────────────────────────────────────────────────────────
+async function refresh() {
+  try {
+    const [status, kpis, equity, signals, calib, pnl, reasons, opens, trades, sigSummary, scan] =
+      await Promise.all([
+        api("/api/status"),
+        api("/api/kpis"),
+        api("/api/equity"),
+        api("/api/signals"),
+        api("/api/calibration"),
+        api("/api/pnl_by_bracket"),
+        api("/api/exit_reasons"),
+        api("/api/open_positions"),
+        api("/api/trades"),
+        api("/api/signal_summary"),
+        api("/api/latest_scan"),
+      ]);
+
+    // Status bar
+    const dot  = document.getElementById("status-dot");
+    const txt  = document.getElementById("status-text");
+    const foot = document.getElementById("footer-mode");
+    if (status.live) {
+      dot.className = "status-dot live";
+      txt.textContent = "LIVE — " + status.db_path;
+      foot.textContent = "LIVE DATA";
+    } else {
+      dot.className = "status-dot mock";
+      txt.textContent = "MOCK — DB not found · Start the bot for live data";
+      foot.textContent = "MOCK DATA";
+    }
+    document.getElementById("last-updated").textContent =
+      "Updated " + new Date().toLocaleTimeString();
+
+    renderKPIs(kpis);
+    renderEquity(equity);
+    renderReasons(reasons);
+    renderEdge(signals);
+    renderSignalFunnel(sigSummary);
+    renderLatestScan(scan);
+    renderPnlByBracket(pnl);
+    renderCalib(calib);
+    renderPositions(opens);
+    renderTrades(trades);
+
+  } catch (err) {
+    const dot = document.getElementById("status-dot");
+    dot.className = "status-dot";
+    document.getElementById("status-text").textContent =
+      "API unreachable — is dashboard_api.py running? (" + err.message + ")";
+  }
+}
+
+// Boot + auto-refresh every 30s
+refresh();
+setInterval(refresh, 30000);
+</script>
+</body>
+</html>

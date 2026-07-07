@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:api.open-meteo.com)",
+      "Bash(git init *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(gh auth *)",
+      "PowerShell(Get-Command gh -ErrorAction SilentlyContinue)",
+      "Bash(git push *)",
+      "Bash(git ls-remote *)",
+      "Bash(gh repo *)",
+      "Bash(curl -sS -o /dev/null -w \"%{http_code}\\\\n\" https://github.com)",
+      "Bash(curl -sS -o /dev/null -w \"%{http_code}\\\\n\" https://github.com/thegentledadproject/wsss-weatherbot)",
+      "Bash(git config *)",
+      "Bash(GIT_CURL_VERBOSE=1 git ls-remote https://github.com/thegentledadproject/wsss-weatherbot.git)"
+    ]
+  }
+}
