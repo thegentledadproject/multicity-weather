@@ -387,7 +387,7 @@ class PositionMonitor:
         """
         sg_now         = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
         hour_cutoff    = sg_now.hour >= HARD_EXIT_HOUR_SGT
-        open_positions = self.ledger.get_open_positions()
+        open_positions = self.ledger.get_open_positions(self.icao)
         results        = []
 
         if not open_positions:
@@ -591,7 +591,7 @@ class PositionMonitor:
                 reason=reason, entry_price=decision.entry_price,
                 exit_price=exit_vwap, size_usd=size_usd,
                 realised_pnl=realised_pnl, opened_at=opened_at,
-                market_date=market_date,
+                market_date=market_date, icao=self.icao,
             )
             return self._result(decision, size_usd, opened_at, exit_vwap, True, reason, realised_pnl)
 

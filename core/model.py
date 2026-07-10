@@ -1,6 +1,8 @@
 """
 core/model.py — H1: Skewnorm bracket probability model
 v4.5: Dual forecast source — GFS ensemble + ECMWF ensemble, blended.
+v5.0: City-agnostic — lat/lon, skew table, and hard-prior values now come
+      from a config.cities.CityConfig instead of module-level WSSS constants.
 
 FORECAST PIPELINE:
   Source 1 — GFS 31-member ensemble (Open-Meteo ensemble API)
@@ -19,7 +21,7 @@ FORECAST PIPELINE:
 
   If only one source available: use that source alone (log WARNING).
   If neither: fallback to standard GFS forecast API (diurnal proxy sigma).
-  If that fails: hard prior (31.5°C, 1.0°C) — NO TRADING.
+  If that fails: hard prior (from CityConfig.hard_prior_mu/sigma) — NO TRADING.
 
 Bracket probabilities:
   P(bracket) = CDF(upper_bound) - CDF(lower_bound)
@@ -38,13 +40,13 @@ from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger("hermes.model")
 
-# WSSS (Changi Airport) coordinates
-WSSS_LAT = 1.3644
-WSSS_LON = 103.9915
-
 # ── Open-Meteo ensemble API ─────────────────────────────────────────────────
 # GFS: 31 members | ECMWF: 51 members
-# Both available free, no API key required.
+# Both available free, no API key required. Timezone left as Singapore for
+# the shared template's default — callers that need a different tz can
+# still get correct UTC-anchored peak-hour data since hourly timestamps are
+# ISO and peak-hour extraction (06:00-21:00) is a local-time convention
+# specific to WSSS's usage; other cities should verify this window applies.
 _ENSEMBLE_BASE = (
     "https://ensemble-api.open-meteo.com/v1/ensemble"
     "?latitude={lat}&longitude={lon}"
@@ -70,36 +72,8 @@ OPEN_METEO_FORECAST_URL = (
 ECMWF_WEIGHT = 0.60   # ECMWF weighted higher — lower tropical RMSE
 GFS_WEIGHT   = 1.0 - ECMWF_WEIGHT
 
-# ── Per-ICAO, per-month skew parameters ─────────────────────────────────────
-# Negative = left skew (colder tail heavier).
-# SW monsoon months (May–Sep): stronger left skew.
-SKEW_ALPHA_TABLE: Dict[Tuple[str, int], float] = {
-    ("WSSS", 1): -1.0,  ("WSSS", 2): -1.0,
-    ("WSSS", 3): -1.2,  ("WSSS", 4): -1.8,
-    ("WSSS", 5): -2.0,  ("WSSS", 6): -2.2,
-    ("WSSS", 7): -2.2,  ("WSSS", 8): -2.0,
-    ("WSSS", 9): -1.8,  ("WSSS", 10): -1.3,
-    ("WSSS", 11): -1.0, ("WSSS", 12): -1.0,
-}
-DEFAULT_SKEW_ALPHA = -1.5
-
-# Bracket boundaries use TRUNCATION, not rounding.
-# Confirmed from Polymarket market rules + resolution-source behaviour:
-#   "resolves to the temperature range that CONTAINS the highest temperature...
-#    measures temperatures to whole degrees Celsius (eg, 9°C)"
-#   A Wunderground reading of 31.4°C → 31°C bucket. 31.9°C → also 31°C.
-#   So "31°C" means the true station max is in [31.0, 32.0).
-# Using [X.0, X.99] (the old values) systematically dropped ~1% of probability
-# mass into the 0.01°C gaps between buckets, biasing every bracket's edge.
-# The upper bound is EXCLUSIVE (CDF differencing treats it as the next bucket's
-# lower bound, so [31.0, 32.0) and [32.0, 33.0) partition cleanly with no overlap).
-BRACKETS = {
-    "29°C": (29.0, 30.0),
-    "30°C": (30.0, 31.0),
-    "31°C": (31.0, 32.0),
-    "32°C": (32.0, 33.0),
-    "33°C": (33.0, 34.0),
-}
+# Bracket boundaries use TRUNCATION, not rounding — see CityConfig.bracket_bounds
+# for the per-city definition (moved out of this module in v5.0).
 
 
 class ForecastResult:
@@ -129,18 +103,20 @@ class ForecastResult:
         return f"ForecastResult({', '.join(parts)})"
 
 
-def _fetch_ensemble_members(url: str, timeout: int, model_name: str) -> Optional[Tuple[float, float, int]]:
+def _fetch_ensemble_members(
+    url: str, lat: float, lon: float, timeout: int, model_name: str,
+) -> Optional[Tuple[float, float, int]]:
     """
     Fetch ensemble members from Open-Meteo and compute (mu, sigma, n_members).
     Returns None on any failure.
 
-    Peak heating window: hours 06:00–21:00 SGT (T06 to T21 in ISO strings).
-    Daily max per member = max temperature across this window.
+    Peak heating window: hours 06:00–21:00 (local, per URL timezone). Daily
+    max per member = max temperature across this window.
     mu    = mean of member daily maxes
     sigma = std dev of member daily maxes (ddof=1), clipped to [0.30, 2.00]
     """
     try:
-        resp = requests.get(url.format(lat=WSSS_LAT, lon=WSSS_LON), timeout=timeout)
+        resp = requests.get(url.format(lat=lat, lon=lon), timeout=timeout)
         resp.raise_for_status()
         data   = resp.json()
         hourly = data.get("hourly", {})
@@ -247,21 +223,28 @@ def _blend(
     return ForecastResult(mu=0.0, sigma=0.0, source="none")
 
 
-def fetch_gfs_forecast(timeout: int = 15) -> ForecastResult:
+def fetch_gfs_forecast(
+    lat: float,
+    lon: float,
+    hard_prior_mu: float = 31.5,
+    hard_prior_sigma: float = 1.0,
+    timeout: int = 15,
+) -> ForecastResult:
     """
-    Fetch dual-source forecast and return blended ForecastResult.
+    Fetch dual-source forecast for the given coordinates and return a
+    blended ForecastResult.
 
     Pipeline:
       1. Fetch GFS 31-member ensemble (parallel-capable but sequential here)
       2. Fetch ECMWF 51-member ensemble
       3. Blend → ForecastResult(source="ensemble_blend")
       4. If both fail → standard GFS forecast API (diurnal sigma proxy)
-      5. If that fails → hard prior, BLOCK TRADING
+      5. If that fails → hard prior (hard_prior_mu/sigma), BLOCK TRADING
     """
 
     # ── Fetch both ensemble sources ───────────────────────────────────────────
-    gfs_result   = _fetch_ensemble_members(GFS_ENSEMBLE_URL,   timeout, "GFS")
-    ecmwf_result = _fetch_ensemble_members(ECMWF_ENSEMBLE_URL, timeout, "ECMWF")
+    gfs_result   = _fetch_ensemble_members(GFS_ENSEMBLE_URL,   lat, lon, timeout, "GFS")
+    ecmwf_result = _fetch_ensemble_members(ECMWF_ENSEMBLE_URL, lat, lon, timeout, "ECMWF")
 
     blended = _blend(gfs_result, ecmwf_result)
     if blended.source != "none":
@@ -270,7 +253,7 @@ def fetch_gfs_forecast(timeout: int = 15) -> ForecastResult:
     # ── Fallback 1: standard forecast API (GFS deterministic) ────────────────
     logger.warning("[MODEL] Both ensemble sources failed — trying standard GFS forecast API")
     try:
-        url  = OPEN_METEO_FORECAST_URL.format(lat=WSSS_LAT, lon=WSSS_LON)
+        url  = OPEN_METEO_FORECAST_URL.format(lat=lat, lon=lon)
         resp = requests.get(url, timeout=timeout)
         resp.raise_for_status()
         data  = resp.json()
@@ -281,8 +264,7 @@ def fetch_gfs_forecast(timeout: int = 15) -> ForecastResult:
         if t_max is not None:
             mu = float(t_max)
             # Use explicit None check, not truthiness: `t_min or (t_max-4)` would
-            # wrongly discard a valid t_min of 0.0. Harmless for tropical WSSS
-            # (min never near 0°C) but incorrect in general.
+            # wrongly discard a valid t_min of 0.0.
             t_min_eff = t_min if t_min is not None else (t_max - 4)
             sigma = float(np.clip((t_max - t_min_eff) / 4.0, 0.50, 1.50))
             logger.warning(
@@ -295,20 +277,24 @@ def fetch_gfs_forecast(timeout: int = 15) -> ForecastResult:
         logger.error(f"[MODEL] Standard forecast API failed: {e}")
 
     # ── Fallback 2: hard prior — block trading ────────────────────────────────
-    logger.error("[MODEL] All forecast sources failed. Using prior μ=31.5°C σ=1.0°C. NO TRADING.")
-    return ForecastResult(mu=31.5, sigma=1.0, source="fallback")
+    logger.error(
+        f"[MODEL] All forecast sources failed. Using prior "
+        f"μ={hard_prior_mu:.1f}°C σ={hard_prior_sigma:.1f}°C. NO TRADING."
+    )
+    return ForecastResult(mu=hard_prior_mu, sigma=hard_prior_sigma, source="fallback")
 
 
 class BracketModel:
     """
-    Computes bracket probabilities for WSSS temperature markets.
+    Computes bracket probabilities for a city's temperature markets.
     Applies trailing bias correction from the calibration ledger.
     Uses blended GFS+ECMWF forecast when available.
     """
 
-    def __init__(self, trailing_bias: float = 0.0, icao: str = "WSSS"):
+    def __init__(self, city_config, trailing_bias: float = 0.0):
+        self.city_config   = city_config
+        self.icao          = city_config.icao
         self.trailing_bias = trailing_bias
-        self.icao          = icao
 
     def compute(
         self,
@@ -317,7 +303,7 @@ class BracketModel:
     ) -> Dict[str, float]:
         """
         Returns {bracket_label: probability} for all defined brackets.
-        Probabilities sum to < 1.0 (remainder = tails outside [29.0, 34.0)).
+        Probabilities sum to < 1.0 (remainder = tails outside the bracket range).
         Returns {} if forecast source is "fallback" or "none" — no trading.
         """
         if forecast.source in ("fallback", "none"):
@@ -330,17 +316,18 @@ class BracketModel:
             sg_now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
             month  = sg_now.month
 
-        alpha  = SKEW_ALPHA_TABLE.get((self.icao.upper(), month), DEFAULT_SKEW_ALPHA)
+        config = self.city_config
+        alpha  = config.skew_alpha_by_month.get(month, config.default_skew_alpha)
         cal_mu = forecast.mu + self.trailing_bias
 
         logger.info(
-            f"[MODEL] μ_blend={forecast.mu:.3f} bias={self.trailing_bias:+.3f} "
+            f"[MODEL] {self.icao} μ_blend={forecast.mu:.3f} bias={self.trailing_bias:+.3f} "
             f"→ μ_cal={cal_mu:.3f} σ={forecast.sigma:.3f} α={alpha} "
             f"src={forecast.source}"
         )
 
         probs: Dict[str, float] = {}
-        for label, (lo, hi) in BRACKETS.items():
+        for label, (lo, hi) in config.bracket_bounds.items():
             p = (
                 skewnorm.cdf(hi, alpha, loc=cal_mu, scale=forecast.sigma)
                 - skewnorm.cdf(lo, alpha, loc=cal_mu, scale=forecast.sigma)

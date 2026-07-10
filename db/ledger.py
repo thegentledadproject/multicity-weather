@@ -75,6 +75,7 @@ class Ledger:
                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp       TEXT    NOT NULL,
                     date            TEXT    NOT NULL,
+                    icao_code       TEXT    NOT NULL DEFAULT 'WSSS',
                     bracket_label   TEXT    NOT NULL,
                     model_prob      REAL    NOT NULL,
                     market_price    REAL    NOT NULL,
@@ -85,16 +86,19 @@ class Ledger:
                 );
 
                 CREATE TABLE IF NOT EXISTS token_matrix (
-                    bracket_label   TEXT    PRIMARY KEY,
+                    icao_code       TEXT    NOT NULL DEFAULT 'WSSS',
+                    bracket_label   TEXT    NOT NULL,
                     token_id        TEXT    NOT NULL,
                     market_date     TEXT    NOT NULL,
-                    updated_at      TEXT    NOT NULL
+                    updated_at      TEXT    NOT NULL,
+                    PRIMARY KEY (icao_code, bracket_label)
                 );
 
                 CREATE TABLE IF NOT EXISTS exit_log (
                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp       TEXT    NOT NULL,
                     market_date     TEXT    NOT NULL DEFAULT '',
+                    icao_code       TEXT    NOT NULL DEFAULT 'WSSS',
                     token_id        TEXT    NOT NULL,
                     bracket_label   TEXT    NOT NULL,
                     direction       TEXT    NOT NULL,
@@ -123,22 +127,54 @@ class Ledger:
         "no such column" before this migration ever runs.
         """
         with self._conn() as conn:
-            for table, col in [("calibration_logs", "market_date"),
-                                ("exit_log", "market_date"),
-                                ("open_positions", "market_date")]:
+            for table, col, default in [
+                ("calibration_logs", "market_date", "''"),
+                ("exit_log",         "market_date", "''"),
+                ("open_positions",   "market_date", "''"),
+                ("signal_log",       "icao_code",   "'WSSS'"),
+                ("exit_log",         "icao_code",   "'WSSS'"),
+            ]:
                 cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})")]
                 if col not in cols:
                     logger.info(f"[LEDGER] Migrating: adding {col} to {table}")
-                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT NOT NULL DEFAULT {default}")
 
-            # Indexes — safe now that market_date is guaranteed present on both tables.
+            # token_matrix: pre-multi-city DBs have bracket_label as sole PRIMARY
+            # KEY, which collides once a second city trades an overlapping
+            # bracket label (e.g. two cities both listing "31°C"). SQLite has no
+            # ALTER TABLE for primary keys, so rebuild via a temp table — guarded
+            # so it only runs once, on a DB that still has the old single-column PK.
+            tm_cols = list(conn.execute("PRAGMA table_info(token_matrix)"))
+            tm_pk_cols = [r["name"] for r in tm_cols if r["pk"] > 0]
+            if tm_pk_cols == ["bracket_label"]:
+                logger.info("[LEDGER] Migrating: token_matrix -> composite (icao_code, bracket_label) PK")
+                conn.executescript("""
+                    ALTER TABLE token_matrix RENAME TO token_matrix_old;
+                    CREATE TABLE token_matrix (
+                        icao_code       TEXT    NOT NULL DEFAULT 'WSSS',
+                        bracket_label   TEXT    NOT NULL,
+                        token_id        TEXT    NOT NULL,
+                        market_date     TEXT    NOT NULL,
+                        updated_at      TEXT    NOT NULL,
+                        PRIMARY KEY (icao_code, bracket_label)
+                    );
+                    INSERT INTO token_matrix (icao_code, bracket_label, token_id, market_date, updated_at)
+                        SELECT 'WSSS', bracket_label, token_id, market_date, updated_at FROM token_matrix_old;
+                    DROP TABLE token_matrix_old;
+                """)
+
+            # Indexes — safe now that market_date/icao_code are guaranteed present.
             conn.executescript("""
                 CREATE INDEX IF NOT EXISTS idx_calib_icao_date
                     ON calibration_logs(icao_code, market_date);
                 CREATE INDEX IF NOT EXISTS idx_signal_date_bracket
                     ON signal_log(date, bracket_label);
+                CREATE INDEX IF NOT EXISTS idx_signal_icao_date
+                    ON signal_log(icao_code, date);
                 CREATE INDEX IF NOT EXISTS idx_exit_market_date
                     ON exit_log(market_date);
+                CREATE INDEX IF NOT EXISTS idx_exit_icao_date
+                    ON exit_log(icao_code, market_date);
             """)
 
     # ── Calibration ───────────────────────────────────────────────────────────
@@ -214,21 +250,21 @@ class Ledger:
 
     # ── Token matrix (refreshed daily by discovery job) ──────────────────────
 
-    def upsert_token_matrix(self, bracket_label: str, token_id: str, market_date: str):
+    def upsert_token_matrix(self, bracket_label: str, token_id: str, market_date: str, icao: str = "WSSS"):
         ts = datetime.datetime.utcnow().isoformat()
         with self._conn() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO token_matrix "
-                "(bracket_label, token_id, market_date, updated_at) "
-                "VALUES (?, ?, ?, ?)",
-                (bracket_label, token_id, market_date, ts),
+                "(icao_code, bracket_label, token_id, market_date, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (icao.upper(), bracket_label, token_id, market_date, ts),
             )
 
-    def get_token_matrix(self, market_date: str) -> Dict[str, str]:
+    def get_token_matrix(self, market_date: str, icao: str = "WSSS") -> Dict[str, str]:
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT bracket_label, token_id FROM token_matrix WHERE market_date = ?",
-                (market_date,),
+                "SELECT bracket_label, token_id FROM token_matrix WHERE market_date = ? AND icao_code = ?",
+                (market_date, icao.upper()),
             ).fetchall()
         return {r["bracket_label"]: r["token_id"] for r in rows}
 
@@ -282,8 +318,12 @@ class Ledger:
             )
         logger.info(f"[LEDGER] Position closed: {token_id}")
 
-    def get_open_positions(self) -> List[sqlite3.Row]:
+    def get_open_positions(self, icao: Optional[str] = None) -> List[sqlite3.Row]:
         with self._conn() as conn:
+            if icao:
+                return conn.execute(
+                    "SELECT * FROM open_positions WHERE icao_code = ?", (icao.upper(),)
+                ).fetchall()
             return conn.execute("SELECT * FROM open_positions").fetchall()
 
     def update_peak_price(self, token_id: str, new_peak: float):
@@ -339,6 +379,7 @@ class Ledger:
         self, date: str, bracket_label: str,
         model_prob: float, market_price: float,
         edge: float, action: str, gate_reason: str = "",
+        icao: str = "WSSS",
     ):
         """
         gate_reason: previously a schema column that existed but was never
@@ -352,17 +393,17 @@ class Ledger:
         with self._conn() as conn:
             conn.execute(
                 "INSERT INTO signal_log "
-                "(timestamp, date, bracket_label, model_prob, market_price, edge, action, gate_reason) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (ts, date, bracket_label, model_prob, market_price, edge, action, gate_reason),
+                "(timestamp, date, icao_code, bracket_label, model_prob, market_price, edge, action, gate_reason) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (ts, date, icao.upper(), bracket_label, model_prob, market_price, edge, action, gate_reason),
             )
 
-    def mark_signal_settled(self, date: str, bracket_label: str, outcome: str):
+    def mark_signal_settled(self, date: str, bracket_label: str, outcome: str, icao: str = "WSSS"):
         with self._conn() as conn:
             conn.execute(
                 "UPDATE signal_log SET settled_outcome = ? "
-                "WHERE date = ? AND bracket_label = ? AND settled_outcome IS NULL",
-                (outcome, date, bracket_label),
+                "WHERE date = ? AND bracket_label = ? AND icao_code = ? AND settled_outcome IS NULL",
+                (outcome, date, bracket_label, icao.upper()),
             )
 
     # ── Exit log ──────────────────────────────────────────────────────────────
@@ -379,6 +420,7 @@ class Ledger:
         realised_pnl: float,
         opened_at:    str,
         market_date:  str = "",
+        icao:         str = "WSSS",
     ):
         """
         Record a completed position exit with P&L.
@@ -400,10 +442,10 @@ class Ledger:
         with self._conn() as conn:
             conn.execute(
                 "INSERT INTO exit_log "
-                "(timestamp, market_date, token_id, bracket_label, direction, reason, "
+                "(timestamp, market_date, icao_code, token_id, bracket_label, direction, reason, "
                 " entry_price, exit_price, size_usd, realised_pnl, opened_at, closed_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (ts, market_date, token_id, bracket_label, direction, reason,
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (ts, market_date, icao.upper(), token_id, bracket_label, direction, reason,
                  entry_price, exit_price, size_usd, realised_pnl, opened_at, ts),
             )
         pnl_pct = (realised_pnl / size_usd * 100) if size_usd else 0.0
@@ -412,9 +454,14 @@ class Ledger:
             f"reason={reason} P&L={realised_pnl:+.4f} ({pnl_pct:+.1f}%)"
         )
 
-    def get_exit_log(self, date: str = None) -> List[sqlite3.Row]:
+    def get_exit_log(self, date: str = None, icao: Optional[str] = None) -> List[sqlite3.Row]:
         """Return exit records. If date given (YYYY-MM-DD SGT market date), filter on it."""
         with self._conn() as conn:
+            if date and icao:
+                return conn.execute(
+                    "SELECT * FROM exit_log WHERE market_date = ? AND icao_code = ? ORDER BY id DESC",
+                    (date, icao.upper()),
+                ).fetchall()
             if date:
                 return conn.execute(
                     "SELECT * FROM exit_log WHERE market_date = ? ORDER BY id DESC",
@@ -424,12 +471,19 @@ class Ledger:
                 "SELECT * FROM exit_log ORDER BY id DESC LIMIT 100"
             ).fetchall()
 
-    def daily_pnl(self, date: str) -> float:
+    def daily_pnl(self, date: str, icao: Optional[str] = None) -> float:
         """Sum of realised_pnl for all exits on a given SGT market date."""
         with self._conn() as conn:
-            row = conn.execute(
-                "SELECT COALESCE(SUM(realised_pnl), 0.0) FROM exit_log WHERE market_date = ?",
-                (date,),
-            ).fetchone()
+            if icao:
+                row = conn.execute(
+                    "SELECT COALESCE(SUM(realised_pnl), 0.0) FROM exit_log "
+                    "WHERE market_date = ? AND icao_code = ?",
+                    (date, icao.upper()),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COALESCE(SUM(realised_pnl), 0.0) FROM exit_log WHERE market_date = ?",
+                    (date,),
+                ).fetchone()
         return float(row[0]) if row else 0.0
 

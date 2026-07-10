@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Hermes v4.5 — WSSS Weather Arb</title>
+<title>Hermes v5.0 — Weather Arb</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <style>
   /* ── Tokens ── */
@@ -144,6 +144,27 @@
   @media (max-width: 560px) {
     .kpi-row { grid-template-columns: repeat(2,1fr); }
   }
+
+  /* ── Overview (center dashboard) ── */
+  .combined-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px;
+                  margin-bottom: 20px; }
+  .city-grid    { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+                  gap: 14px; }
+  .city-card    { background: var(--surf); border: 1px solid var(--border);
+                  border-radius: var(--radius); padding: 16px 18px; cursor: pointer;
+                  transition: border-color .15s; }
+  .city-card:hover { border-color: var(--amber); }
+  .city-card-top { display: flex; justify-content: space-between; align-items: baseline;
+                    margin-bottom: 10px; }
+  .city-card-name { font-size: 15px; font-weight: 700; }
+  .city-card-icao { font-size: 10px; color: var(--muted); letter-spacing: 1px; }
+  .city-card-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; }
+  .city-stat-label { font-size: 9px; letter-spacing: 1px; text-transform: uppercase;
+                      color: var(--muted); }
+  .city-stat-value { font-family: var(--font-mono); font-size: 14px; font-weight: 600; }
+  .btn-back { background: none; border: none; color: var(--muted); cursor: pointer;
+              font-size: 11px; letter-spacing: 1px; padding: 6px 0; margin-bottom: 4px; }
+  .btn-back:hover { color: var(--amber); }
 </style>
 </head>
 <body>
@@ -152,14 +173,48 @@
   <!-- Header -->
   <div class="header">
     <div class="header-left">
-      <div class="eyebrow">Hermes v4.5</div>
-      <h1>WSSS Weather Bracket Arb <span style="color:var(--muted);font-weight:400;font-size:16px">· Live Dashboard</span></h1>
+      <div class="eyebrow">Hermes v5.0</div>
+      <h1 id="page-title">Weather Bracket Arb <span style="color:var(--muted);font-weight:400;font-size:16px">· Live Dashboard</span></h1>
     </div>
     <div class="header-right">
       <div class="clock" id="clock">—</div>
-      <button class="btn-refresh" onclick="refresh()">⟳ Refresh</button>
+      <button class="btn-refresh" onclick="refreshCurrent()">⟳ Refresh</button>
     </div>
   </div>
+
+  <!-- Overview (center dashboard) -->
+  <div id="overview-view">
+    <div class="combined-row">
+      <div class="kpi-card">
+        <div class="kpi-label">Combined Vault</div>
+        <div class="kpi-value amber" id="ov-vault">—</div>
+        <div class="kpi-sub" id="ov-pnl">—</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Combined ROI</div>
+        <div class="kpi-value" id="ov-roi">—</div>
+        <div class="kpi-sub" id="ov-roi-sub">—</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Cities Trading</div>
+        <div class="kpi-value teal" id="ov-cities">—</div>
+        <div class="kpi-sub">configured</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Open Positions</div>
+        <div class="kpi-value amber" id="ov-open">—</div>
+        <div class="kpi-sub">across all cities</div>
+      </div>
+    </div>
+    <div class="section-title">Cities</div>
+    <div class="city-grid" id="city-grid">
+      <div class="pos-empty">Loading cities…</div>
+    </div>
+  </div>
+
+  <!-- Per-city detail view (WSSS-style dashboard, filtered by currentIcao) -->
+  <div id="detail-view" style="display:none">
+  <button class="btn-back" onclick="showOverview()">← Overview</button>
 
   <!-- Status bar -->
   <div class="status-bar">
@@ -286,9 +341,10 @@
   </div>
 
   <div class="footer">
-    Hermes v4.5 · WSSS Changi Airport · GFS+ECMWF blend · Trailing stop 20% · Edge threshold 5%
+    Hermes v5.0 · <span id="footer-city">—</span> · GFS+ECMWF blend · Trailing stop 20% · Edge threshold 5%
     <br>Refreshes every 30 seconds · <span id="footer-mode">—</span>
   </div>
+  </div> <!-- /detail-view -->
 </div>
 
 <script>
@@ -298,6 +354,8 @@ const BG = "#0d1117", SURF = "#161b22", BORDER = "#21262d";
 const AMBER = "#f59e0b", TEAL = "#22d3ee", GREEN = "#22c55e", RED = "#ef4444", MUTED = "#6e7681";
 
 let charts = {};
+let currentIcao = null;      // null = overview view; set to an ICAO to view that city's detail dashboard
+let cityRegistry = [];       // populated from /api/cities
 
 // ── Clock ─────────────────────────────────────────────────────────────────────
 function updateClock() {
@@ -331,6 +389,79 @@ async function api(path) {
   const r = await fetch(API + path);
   if (!r.ok) throw new Error(r.status);
   return r.json();
+}
+
+function icaoParam(path) {
+  const sep = path.includes("?") ? "&" : "?";
+  return `${path}${sep}icao=${encodeURIComponent(currentIcao || "WSSS")}`;
+}
+
+// ── Overview (center dashboard) ──────────────────────────────────────────────
+function renderOverview(d) {
+  const c = d.combined;
+  document.getElementById("ov-vault").textContent = "$" + c.vault_current.toFixed(2);
+  const pnlEl = document.getElementById("ov-pnl");
+  pnlEl.textContent = (c.net_pnl >= 0 ? "+" : "") + "$" + c.net_pnl.toFixed(4) + " net P&L";
+  pnlEl.className = "kpi-sub " + (c.net_pnl >= 0 ? "positive" : "negative");
+  const roiEl = document.getElementById("ov-roi");
+  roiEl.textContent = (c.roi_pct >= 0 ? "+" : "") + c.roi_pct.toFixed(1) + "%";
+  roiEl.className = "kpi-value " + (c.roi_pct >= 0 ? "positive" : "negative");
+  document.getElementById("ov-roi-sub").textContent = "from $" + c.vault_start.toFixed(0) + " start";
+  document.getElementById("ov-cities").textContent = d.cities.length;
+  document.getElementById("ov-open").textContent = d.cities.reduce((s, r) => s + r.open_positions, 0);
+
+  const grid = document.getElementById("city-grid");
+  if (!d.cities.length) {
+    grid.innerHTML = '<div class="pos-empty">No cities configured.</div>';
+    return;
+  }
+  grid.innerHTML = d.cities.map(c => {
+    const roiCls = c.roi_pct >= 0 ? "positive" : "negative";
+    return `
+<div class="city-card" onclick="showCity('${c.icao}')">
+  <div class="city-card-top">
+    <span class="city-card-name">${c.display_name}</span>
+    <span class="city-card-icao">${c.icao}</span>
+  </div>
+  <div class="city-card-stats">
+    <div><div class="city-stat-label">Vault</div><div class="city-stat-value">$${c.vault_current.toFixed(2)}</div></div>
+    <div><div class="city-stat-label">ROI</div><div class="city-stat-value ${roiCls}">${c.roi_pct >= 0 ? "+" : ""}${c.roi_pct.toFixed(1)}%</div></div>
+    <div><div class="city-stat-label">Win Rate</div><div class="city-stat-value">${c.win_rate_pct.toFixed(1)}%</div></div>
+    <div><div class="city-stat-label">Open Positions</div><div class="city-stat-value amber">${c.open_positions}</div></div>
+  </div>
+</div>`;
+  }).join("");
+}
+
+async function refreshOverview() {
+  try {
+    const ov = await api("/api/overview");
+    renderOverview(ov);
+  } catch (err) { /* leave last-known overview in place */ }
+}
+
+function showOverview() {
+  currentIcao = null;
+  document.getElementById("overview-view").style.display = "";
+  document.getElementById("detail-view").style.display = "none";
+  refreshOverview();
+}
+
+function showCity(icao) {
+  currentIcao = icao;
+  const city = cityRegistry.find(c => c.icao === icao);
+  document.getElementById("page-title").innerHTML =
+    (city ? city.display_name : icao) + ' Weather Bracket Arb <span style="color:var(--muted);font-weight:400;font-size:16px">· Live Dashboard</span>';
+  document.getElementById("footer-city").textContent = (city ? city.display_name : icao) + " (" + icao + ")";
+  document.getElementById("overview-view").style.display = "none";
+  document.getElementById("detail-view").style.display = "";
+  refresh();
+  pollUpstreamStatus();
+}
+
+function refreshCurrent() {
+  if (currentIcao) { refresh(); pollUpstreamStatus(); }
+  else { refreshOverview(); }
 }
 
 // ── Renderers ─────────────────────────────────────────────────────────────────
@@ -687,8 +818,9 @@ function setUpstreamUI(state, text, latencyMs) {
 }
 
 async function pollUpstreamStatus() {
+  if (!currentIcao) return;   // no upstream dot on the overview page
   try {
-    const u = await api("/api/upstream_status");
+    const u = await api(icaoParam("/api/upstream_status"));
     if (u.ok) {
       setUpstreamUI("live", "ECMWF: reachable" + (u.cached ? " (cached)" : ""), u.latency_ms);
     } else {
@@ -701,19 +833,20 @@ async function pollUpstreamStatus() {
 
 // ── Main refresh (heavier data — charts, tables) ─────────────────────────────
 async function refresh() {
+  if (!currentIcao) return;   // detail-view only; overview uses refreshOverview()
   try {
     const [kpis, equity, signals, calib, pnl, reasons, opens, trades, sigSummary, scan] =
       await Promise.all([
-        api("/api/kpis"),
-        api("/api/equity"),
-        api("/api/signals"),
-        api("/api/calibration"),
-        api("/api/pnl_by_bracket"),
-        api("/api/exit_reasons"),
-        api("/api/open_positions"),
-        api("/api/trades"),
-        api("/api/signal_summary"),
-        api("/api/latest_scan"),
+        api(icaoParam("/api/kpis")),
+        api(icaoParam("/api/equity")),
+        api(icaoParam("/api/signals")),
+        api(icaoParam("/api/calibration")),
+        api(icaoParam("/api/pnl_by_bracket")),
+        api(icaoParam("/api/exit_reasons")),
+        api(icaoParam("/api/open_positions")),
+        api(icaoParam("/api/trades")),
+        api(icaoParam("/api/signal_summary")),
+        api(icaoParam("/api/latest_scan")),
       ]);
 
     document.getElementById("last-updated").textContent =
@@ -737,13 +870,22 @@ async function refresh() {
 }
 
 // Boot: backend status polls every 3s, upstream ECMWF status every 10s
-// (backend caches upstream checks for 30s regardless), full data refresh every 30s
+// (backend caches upstream checks for 30s regardless), full data refresh every 30s.
+// Starts on the overview (center dashboard); city registry loads once so
+// showCity() can resolve display names for the header/footer.
+async function boot() {
+  try {
+    const c = await api("/api/cities");
+    cityRegistry = c.cities;
+  } catch (err) { cityRegistry = []; }
+  showOverview();
+}
+
 pollApiStatus();
-pollUpstreamStatus();
-refresh();
+boot();
 setInterval(pollApiStatus, 3000);
 setInterval(pollUpstreamStatus, 10000);
-setInterval(refresh, 30000);
+setInterval(refreshCurrent, 30000);
 </script>
 </body>
 </html>

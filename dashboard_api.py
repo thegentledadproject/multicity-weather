@@ -1,6 +1,12 @@
 """
-dashboard_api.py — Hermes v4.5 Dashboard REST API
+dashboard_api.py — Hermes Dashboard REST API
 FastAPI backend. Reads hermes.db and serves JSON to the web frontend.
+
+v5.0: multi-city — every trade-data endpoint now takes an optional
+?icao= query param (default "WSSS", preserving pre-v5.0 behavior for any
+caller that omits it) and filters by icao_code. Added /api/cities (city
+registry for the frontend's switcher) and /api/overview (aggregated KPIs
+across every configured city, for the "center dashboard").
 
 Run:  uvicorn dashboard_api:app --host 0.0.0.0 --port 8000
 Access: http://YOUR_VPS_IP:8000
@@ -22,31 +28,30 @@ import sqlite3
 import datetime
 import logging
 import contextlib
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import requests
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-from core.model import ECMWF_ENSEMBLE_URL, WSSS_LAT, WSSS_LON
+from core.model import ECMWF_ENSEMBLE_URL
+from config.cities import CITIES, get_city
 
 logger = logging.getLogger("hermes.dashboard_api")
 logging.basicConfig(level=logging.INFO)
 
-DB_PATH      = os.getenv("DB_PATH", "hermes.db")
-VAULT_START  = float(os.getenv("MAX_VAULT_ALLOCATION", 200.0))
+DB_PATH        = os.getenv("DB_PATH", "hermes.db")
+VAULT_TOTAL    = float(os.getenv("MAX_VAULT_ALLOCATION", 200.0))
+DEFAULT_ICAO   = "WSSS"
 _DASHBOARD_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
 
 # ── Upstream (Open-Meteo ECMWF) health check cache ───────────────────────────
-# The dashboard polls this on a short client-side interval to show a live
-# indicator, but the check itself hits the real Open-Meteo API — caching the
-# result server-side for UPSTREAM_CACHE_TTL keeps N dashboard viewers/polls
-# from turning into N x real requests against a third-party service.
+# Keyed by icao since each city polls its own coordinates.
 UPSTREAM_CACHE_TTL = 30.0
-_upstream_cache: Dict[str, Any] = {"result": None, "checked_at": 0.0}
+_upstream_cache: Dict[str, Dict[str, Any]] = {}
 
-app = FastAPI(title="Hermes Dashboard API", version="4.5")
+app = FastAPI(title="Hermes Dashboard API", version="5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -68,14 +73,9 @@ def serve_dashboard():
 @contextlib.contextmanager
 def _conn():
     """
-    Same connection-leak fix as db/ledger.py: a bare sqlite3.Connection
-    used as `with conn:` only wraps a transaction (commit/rollback) — it
-    never calls close(). Confirmed: 200 calls leaked 13+ file descriptors
-    relying on GC timing. This process runs continuously with the
-    dashboard frontend polling every 30s across up to 9 endpoints per
-    poll (kpis() alone makes 7 DB calls) — left unfixed this leaks far
-    faster than the trading bot's own (already-fixed) instance of the
-    same bug.
+    sqlite3.Connection used as `with conn:` only wraps a transaction
+    (commit/rollback) — it never calls close(). This wrapper guarantees
+    close() in a finally block for every call site in this file.
     """
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -93,10 +93,6 @@ def _rows(query: str, params: tuple = ()) -> List[Dict[str, Any]]:
             rows = conn.execute(query, params).fetchall()
             return [dict(r) for r in rows]
     except Exception as e:
-        # Previously a bare `except Exception: return []` with no logging —
-        # that silently swallows genuine bugs (a typo'd column name, a
-        # missing table) as indistinguishable from "DB not ready yet",
-        # making them invisible in journalctl. Log first, then degrade.
         logger.error(f"[DASHBOARD] Query failed: {query[:80]}... — {e}")
         return []
 
@@ -111,6 +107,12 @@ def _scalar(query: str, params: tuple = (), default: Any = 0.0) -> Any:
         logger.error(f"[DASHBOARD] Query failed: {query[:80]}... — {e}")
         return default
 
+def _vault_start(icao: str) -> float:
+    """This city's allocated slice of the total vault."""
+    config = CITIES.get(icao.upper())
+    pct = config.vault_allocation_pct if config else 1.0
+    return VAULT_TOTAL * pct
+
 # ── API routes ────────────────────────────────────────────────────────────────
 
 @app.get("/api/status")
@@ -121,26 +123,48 @@ def status():
     return {
         "live":       live,
         "db_path":    DB_PATH,
-        "vault_start": VAULT_START,
+        "vault_start": VAULT_TOTAL,
         "sgt_now":    sg.strftime("%Y-%m-%d %H:%M SGT"),
         "utc_now":    datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
     }
 
+@app.get("/api/cities")
+def cities():
+    """City registry for the frontend's overview/switcher — no DB dependency."""
+    return {
+        "cities": [
+            {
+                "icao":                 c.icao,
+                "display_name":         c.display_name,
+                "vault_allocation_pct": c.vault_allocation_pct,
+                "vault_start":          _vault_start(c.icao),
+            }
+            for c in CITIES.values()
+        ]
+    }
+
 @app.get("/api/upstream_status")
-def upstream_status():
+def upstream_status(icao: str = DEFAULT_ICAO):
     """
-    Live reachability check for the Open-Meteo ECMWF ensemble API — the
-    upstream forecast source core/model.py depends on for mu_ecmwf/sigma_ecmwf.
-    If this is down, the bot falls back to GFS-only (or the hard prior),
-    which is exactly the kind of degradation an operator wants surfaced
-    on the dashboard rather than discovered later in the logs.
+    Live reachability check for the Open-Meteo ECMWF ensemble API at this
+    city's coordinates — the upstream forecast source core/model.py depends
+    on for mu_ecmwf/sigma_ecmwf. If this is down, the bot falls back to
+    GFS-only (or the hard prior), which is exactly the kind of degradation
+    an operator wants surfaced on the dashboard rather than discovered later.
     """
+    icao = icao.upper()
     now = time.monotonic()
-    cached = _upstream_cache["result"]
-    if cached is not None and (now - _upstream_cache["checked_at"]) < UPSTREAM_CACHE_TTL:
+    cached = _upstream_cache.get(icao, {}).get("result")
+    checked_at = _upstream_cache.get(icao, {}).get("checked_at", 0.0)
+    if cached is not None and (now - checked_at) < UPSTREAM_CACHE_TTL:
         return {**cached, "cached": True}
 
-    url = ECMWF_ENSEMBLE_URL.format(lat=WSSS_LAT, lon=WSSS_LON)
+    try:
+        config = get_city(icao)
+    except KeyError:
+        return {"ok": False, "error": f"unknown city '{icao}'", "cached": False}
+
+    url = ECMWF_ENSEMBLE_URL.format(lat=config.lat, lon=config.lon)
     t0 = time.monotonic()
     try:
         r = requests.get(url, timeout=5)
@@ -152,7 +176,7 @@ def upstream_status():
             "source":       "ecmwf_ensemble",
         }
     except requests.RequestException as e:
-        logger.error(f"[DASHBOARD] Upstream ECMWF check failed: {e}")
+        logger.error(f"[DASHBOARD] Upstream ECMWF check failed for {icao}: {e}")
         result = {
             "ok":           False,
             "status_code":  None,
@@ -162,38 +186,42 @@ def upstream_status():
             "error":        str(e),
         }
 
-    _upstream_cache["result"]     = result
-    _upstream_cache["checked_at"] = now
+    _upstream_cache[icao] = {"result": result, "checked_at": now}
     return {**result, "cached": False}
 
 @app.get("/api/kpis")
-def kpis():
-    """Headline KPI numbers."""
-    net_pnl      = _scalar("SELECT COALESCE(SUM(realised_pnl),0) FROM exit_log")
-    total_trades = _scalar("SELECT COUNT(*) FROM exit_log", default=0)
-    wins         = _scalar("SELECT COUNT(*) FROM exit_log WHERE realised_pnl > 0", default=0)
+def kpis(icao: str = DEFAULT_ICAO):
+    """Headline KPI numbers for one city."""
+    icao        = icao.upper()
+    vault_start = _vault_start(icao)
+    net_pnl      = _scalar("SELECT COALESCE(SUM(realised_pnl),0) FROM exit_log WHERE icao_code = ?", (icao,))
+    total_trades = _scalar("SELECT COUNT(*) FROM exit_log WHERE icao_code = ?", (icao,), default=0)
+    wins         = _scalar(
+        "SELECT COUNT(*) FROM exit_log WHERE icao_code = ? AND realised_pnl > 0", (icao,), default=0,
+    )
     trail_bias   = _scalar("""
         SELECT AVG(residual) FROM (
-            SELECT residual FROM calibration_logs ORDER BY id DESC LIMIT 10
+            SELECT residual FROM calibration_logs WHERE icao_code = ? ORDER BY id DESC LIMIT 10
         )
-    """, default=0.0)
-    mae          = _scalar("SELECT AVG(ABS(residual)) FROM calibration_logs", default=0.0)
-    n_calib      = _scalar("SELECT COUNT(*) FROM calibration_logs", default=0)
-    n_open       = _scalar("SELECT COUNT(*) FROM open_positions", default=0)
+    """, (icao,), default=0.0)
+    mae          = _scalar("SELECT AVG(ABS(residual)) FROM calibration_logs WHERE icao_code = ?", (icao,), default=0.0)
+    n_calib      = _scalar("SELECT COUNT(*) FROM calibration_logs WHERE icao_code = ?", (icao,), default=0)
+    n_open       = _scalar("SELECT COUNT(*) FROM open_positions WHERE icao_code = ?", (icao,), default=0)
     actionable   = _scalar(
-        "SELECT COUNT(*) FROM signal_log WHERE action IN ('SIGNAL_BUY','SIGNAL_SELL_NO')",
-        default=0,
+        "SELECT COUNT(*) FROM signal_log WHERE icao_code = ? AND action IN ('SIGNAL_BUY','SIGNAL_SELL_NO')",
+        (icao,), default=0,
     )
     avg_edge     = _scalar(
-        "SELECT AVG(ABS(edge)) FROM signal_log WHERE action IN ('SIGNAL_BUY','SIGNAL_SELL_NO')",
-        default=0.0,
+        "SELECT AVG(ABS(edge)) FROM signal_log WHERE icao_code = ? AND action IN ('SIGNAL_BUY','SIGNAL_SELL_NO')",
+        (icao,), default=0.0,
     )
     losses       = total_trades - wins
     win_rate     = (wins / total_trades * 100) if total_trades else 0.0
-    roi          = (net_pnl / VAULT_START * 100) if VAULT_START else 0.0
+    roi          = (net_pnl / vault_start * 100) if vault_start else 0.0
     return {
-        "vault_current":  round(VAULT_START + net_pnl, 2),
-        "vault_start":    VAULT_START,
+        "icao":           icao,
+        "vault_current":  round(vault_start + net_pnl, 2),
+        "vault_start":    vault_start,
         "net_pnl":        round(net_pnl, 4),
         "roi_pct":        round(roi, 2),
         "total_trades":   int(total_trades),
@@ -208,46 +236,99 @@ def kpis():
         "avg_edge_pct":   round(avg_edge * 100, 2),
     }
 
+@app.get("/api/overview")
+def overview():
+    """
+    Aggregated view across every configured city — the "center dashboard".
+    One row per city (allocation, current vault, ROI, win rate, open
+    positions) plus combined totals.
+    """
+    rows = []
+    combined_start = 0.0
+    combined_pnl   = 0.0
+    for config in CITIES.values():
+        icao   = config.icao
+        vstart = _vault_start(icao)
+        pnl    = _scalar("SELECT COALESCE(SUM(realised_pnl),0) FROM exit_log WHERE icao_code = ?", (icao,))
+        total_trades = _scalar("SELECT COUNT(*) FROM exit_log WHERE icao_code = ?", (icao,), default=0)
+        wins   = _scalar("SELECT COUNT(*) FROM exit_log WHERE icao_code = ? AND realised_pnl > 0", (icao,), default=0)
+        n_open = _scalar("SELECT COUNT(*) FROM open_positions WHERE icao_code = ?", (icao,), default=0)
+        avg_edge = _scalar(
+            "SELECT AVG(ABS(edge)) FROM signal_log WHERE icao_code = ? AND action IN ('SIGNAL_BUY','SIGNAL_SELL_NO')",
+            (icao,), default=0.0,
+        )
+        win_rate = (wins / total_trades * 100) if total_trades else 0.0
+        roi      = (pnl / vstart * 100) if vstart else 0.0
+
+        rows.append({
+            "icao":           icao,
+            "display_name":   config.display_name,
+            "vault_start":    round(vstart, 2),
+            "vault_current":  round(vstart + pnl, 2),
+            "net_pnl":        round(pnl, 4),
+            "roi_pct":        round(roi, 2),
+            "total_trades":   int(total_trades),
+            "win_rate_pct":   round(win_rate, 1),
+            "open_positions": int(n_open),
+            "avg_edge_pct":   round(avg_edge * 100, 2),
+        })
+        combined_start += vstart
+        combined_pnl   += pnl
+
+    combined_roi = (combined_pnl / combined_start * 100) if combined_start else 0.0
+    return {
+        "cities": rows,
+        "combined": {
+            "vault_start":   round(combined_start, 2),
+            "vault_current": round(combined_start + combined_pnl, 2),
+            "net_pnl":       round(combined_pnl, 4),
+            "roi_pct":       round(combined_roi, 2),
+        },
+    }
+
 @app.get("/api/equity")
-def equity():
-    """Cumulative vault equity per closed trade."""
+def equity(icao: str = DEFAULT_ICAO):
+    """Cumulative vault equity per closed trade, for one city."""
+    icao = icao.upper()
+    vault_start = _vault_start(icao)
     rows = _rows(
         "SELECT id, bracket_label, direction, reason, "
         "entry_price, exit_price, size_usd, realised_pnl, closed_at "
-        "FROM exit_log ORDER BY id ASC"
+        "FROM exit_log WHERE icao_code = ? ORDER BY id ASC",
+        (icao,),
     )
-    running = VAULT_START
+    running = vault_start
     for r in rows:
         running += r["realised_pnl"]
         r["vault"] = round(running, 4)
-    return {"vault_start": VAULT_START, "trades": rows}
+    return {"vault_start": vault_start, "trades": rows}
 
 @app.get("/api/signals")
-def signals(limit: int = 80):
-    """Recent signal scan results — ALL brackets including non-actionable."""
+def signals(limit: int = 80, icao: str = DEFAULT_ICAO):
+    """Recent signal scan results for one city — ALL brackets including non-actionable."""
     rows = _rows(
         "SELECT id, date, bracket_label, model_prob, market_price, "
         "edge, action, settled_outcome, COALESCE(gate_reason,'') as gate_reason "
-        "FROM signal_log ORDER BY id DESC LIMIT ?",
-        (limit,),
+        "FROM signal_log WHERE icao_code = ? ORDER BY id DESC LIMIT ?",
+        (icao.upper(), limit),
     )
     rows.reverse()
     return {"signals": rows}
 
 
 @app.get("/api/signal_summary")
-def signal_summary():
+def signal_summary(icao: str = DEFAULT_ICAO):
     """
-    Breakdown of signal action labels across all time.
+    Breakdown of signal action labels for one city, across all time.
     Lets the dashboard show a full scan funnel:
       Total priced → Edge threshold met → EV/sizing passed → Executed
     """
     rows = _rows(
         "SELECT action, COUNT(*) as count, "
         "AVG(ABS(edge)) as avg_abs_edge "
-        "FROM signal_log GROUP BY action ORDER BY count DESC"
+        "FROM signal_log WHERE icao_code = ? GROUP BY action ORDER BY count DESC",
+        (icao.upper(),),
     )
-    # Map to display-friendly labels
     LABEL_MAP = {
         "SIGNAL_BUY":     "BUY signal",
         "SIGNAL_SELL_NO": "SELL signal",
@@ -262,17 +343,19 @@ def signal_summary():
     return {"breakdown": rows}
 
 @app.get("/api/latest_scan")
-def latest_scan():
+def latest_scan(icao: str = DEFAULT_ICAO):
     """
-    Every bracket from the MOST RECENT scan cycle — passing AND non-passing.
-    This is the live snapshot: for the current market, which brackets cleared
-    the edge gate, which were held below threshold, and which were gated on
-    liquidity/spread — each with its model prob, market price, and edge.
+    Every bracket from the MOST RECENT scan cycle for one city — passing
+    AND non-passing. The live snapshot: for the current market, which
+    brackets cleared the edge gate, which were held below threshold, and
+    which were gated on liquidity/spread — each with model prob, market
+    price, and edge.
     """
     latest = _rows(
         "SELECT id, date, bracket_label, model_prob, market_price, edge, "
         "action, COALESCE(gate_reason,'') as gate_reason "
-        "FROM signal_log ORDER BY id DESC LIMIT 40"
+        "FROM signal_log WHERE icao_code = ? ORDER BY id DESC LIMIT 40",
+        (icao.upper(),),
     )
     if not latest:
         return {"scan": [], "scan_date": None, "n_brackets": 0,
@@ -314,11 +397,12 @@ def latest_scan():
     }
 
 @app.get("/api/calibration")
-def calibration():
-    """All calibration residuals."""
+def calibration(icao: str = DEFAULT_ICAO):
+    """All calibration residuals for one city."""
     rows = _rows(
         "SELECT id, timestamp, icao_code, model_mu, actual_settled, residual "
-        "FROM calibration_logs ORDER BY id ASC"
+        "FROM calibration_logs WHERE icao_code = ? ORDER BY id ASC",
+        (icao.upper(),),
     )
     # Compute expanding trailing bias
     running_sum = 0.0
@@ -328,30 +412,35 @@ def calibration():
     return {"calibrations": rows}
 
 @app.get("/api/pnl_by_bracket")
-def pnl_by_bracket():
-    """P&L grouped by bracket + direction."""
+def pnl_by_bracket(icao: str = DEFAULT_ICAO):
+    """P&L grouped by bracket + direction, for one city."""
     rows = _rows(
         "SELECT bracket_label, direction, "
         "SUM(realised_pnl) AS total_pnl, COUNT(*) AS n_trades, "
         "SUM(CASE WHEN realised_pnl > 0 THEN 1 ELSE 0 END) AS wins "
-        "FROM exit_log GROUP BY bracket_label, direction ORDER BY bracket_label"
+        "FROM exit_log WHERE icao_code = ? GROUP BY bracket_label, direction ORDER BY bracket_label",
+        (icao.upper(),),
     )
     return {"groups": rows}
 
 @app.get("/api/exit_reasons")
-def exit_reasons():
-    """Exit reason counts."""
+def exit_reasons(icao: str = DEFAULT_ICAO):
+    """Exit reason counts for one city."""
     rows = _rows(
         "SELECT reason, COUNT(*) AS count, "
         "SUM(realised_pnl) AS total_pnl "
-        "FROM exit_log GROUP BY reason ORDER BY count DESC"
+        "FROM exit_log WHERE icao_code = ? GROUP BY reason ORDER BY count DESC",
+        (icao.upper(),),
     )
     return {"reasons": rows}
 
 @app.get("/api/open_positions")
-def open_positions():
-    """All currently open positions with live trail/stop levels."""
-    rows = _rows("SELECT * FROM open_positions ORDER BY opened_at ASC")
+def open_positions(icao: str = DEFAULT_ICAO):
+    """All currently open positions for one city, with live trail/stop levels."""
+    rows = _rows(
+        "SELECT * FROM open_positions WHERE icao_code = ? ORDER BY opened_at ASC",
+        (icao.upper(),),
+    )
     trail_pct   = float(os.getenv("TRAIL_PCT", 0.20))
     edge_thresh = float(os.getenv("EDGE_THRESHOLD", 0.05))
     for r in rows:
@@ -381,12 +470,12 @@ def open_positions():
     return {"positions": rows}
 
 @app.get("/api/trades")
-def trades(limit: int = 100):
-    """Recent trade history."""
+def trades(limit: int = 100, icao: str = DEFAULT_ICAO):
+    """Recent trade history for one city."""
     rows = _rows(
         "SELECT id, closed_at, bracket_label, direction, reason, "
         "entry_price, exit_price, size_usd, realised_pnl, opened_at "
-        "FROM exit_log ORDER BY id DESC LIMIT ?",
-        (limit,),
+        "FROM exit_log WHERE icao_code = ? ORDER BY id DESC LIMIT ?",
+        (icao.upper(), limit),
     )
     return {"trades": rows}

@@ -1,5 +1,8 @@
 """
 core/settlement.py — S1: Settlement detection + calibration write-back
+v5.0: City-agnostic — coordinates and the optional official-station
+fallback now come from a config.cities.CityConfig instead of hardcoded
+WSSS/NEA constants.
 
 Two sub-tasks run in Job 4 (every 15 min, 24/7 as of the round-the-clock
 scheduler redesign — checks both today's and yesterday's market_date
@@ -9,13 +12,15 @@ the early hours of the next):
   Task A — Resolution detection:
     Poll Gamma API outcomePrices for each open position's token_id.
     Terminal: outcomePrices[0] > 0.99 (YES) or < 0.01 (NO).
-    On terminal state → fetch actual temperature from NEA/Open-Meteo
-    historical archive → write calibration residual to ledger.
+    On terminal state → fetch actual temperature from the Open-Meteo
+    historical archive (or the city's official_station_fetcher override,
+    if configured) → write calibration residual to ledger.
 
   Task B — Actual temperature fetch (separate from resolution):
     Uses Open-Meteo historical archive API to get the true observed
-    daily max at WSSS. This is written to calibration_logs regardless
-    of whether we had an open position — it feeds the trailing bias.
+    daily max at the city's coordinates. This is written to
+    calibration_logs regardless of whether we had an open position — it
+    feeds the trailing bias.
 
     THIS IS THE FIX for the settlement inference bug:
     We do NOT infer actual temp from the bracket midpoint.
@@ -35,30 +40,19 @@ logger = logging.getLogger("hermes.settlement")
 GAMMA_MARKETS_URL   = "https://gamma-api.polymarket.com/markets"
 OPEN_METEO_HIST_URL = (
     "https://archive-api.open-meteo.com/v1/archive"
-    "?latitude=1.3644&longitude=103.9915"
+    "?latitude={lat}&longitude={lon}"
     "&daily=temperature_2m_max"
     "&timezone=Asia%2FSingapore"
     "&start_date={date}&end_date={date}"
 )
 
-# NEA Singapore observed weather API (backup for Open-Meteo archive)
-# Returns daily station observations including Changi (station S24)
-NEA_READINGS_URL = (
-    "https://api.data.gov.sg/v1/environment/air-temperature"
-    "?date={date}"
-)
-CHANGI_STATION_ID = "S24"
-
-# Must match the fallback mu in core/model.py's fetch_gfs_forecast().
-# Used to detect and skip calibration writes when Job 2 never ran that day.
-FALLBACK_MU = 31.5
-
 
 class SettlementEngine:
-    def __init__(self, ledger: Ledger, icao: str = "WSSS", timeout: int = 15):
-        self.ledger  = ledger
-        self.icao    = icao
-        self.timeout = timeout
+    def __init__(self, ledger: Ledger, city_config, timeout: int = 15):
+        self.ledger      = ledger
+        self.city_config = city_config
+        self.icao        = city_config.icao
+        self.timeout     = timeout
 
     def run(self, model_mu: float, market_date: Optional[str] = None) -> Dict:
         """
@@ -79,10 +73,9 @@ class SettlementEngine:
         }
 
         # Task A: Check all open positions for resolution
-        open_positions = self.ledger.get_open_positions()
+        open_positions = self.ledger.get_open_positions(self.icao)
         results["positions_checked"] = len(open_positions)
 
-        resolved_any = False
         for pos in open_positions:
             # Use the position's own stored SGT market_date (added when this
             # scheduler redesign threaded market_date through record_position)
@@ -100,24 +93,23 @@ class SettlementEngine:
             )
             if settled:
                 results["positions_settled"] += 1
-                resolved_any = True
 
         # Task B: Fetch actual observed temperature and write calibration log ONCE per day
         # Two guards added after Jul 2 incident:
         #   1. Idempotency — skip if this ICAO already has a row for today's date.
         #      Without this, Job 4 (every 10 min, 17:00-23:50 SGT) writes a fresh
         #      row on every cycle — 15-20+ duplicate rows per real trading day.
-        #   2. Fallback rejection — skip if model_mu == FALLBACK_MU (31.5), which
-        #      means Job 2 never ran that day (e.g. discovery found no token
-        #      matrix). Logging a residual against a hard prior is meaningless
-        #      and corrupts fetch_trailing_bias() for every future day.
+        #   2. Fallback rejection — skip if model_mu == city_config.hard_prior_mu,
+        #      which means Job 2 never ran that day (e.g. discovery found no
+        #      token matrix). Logging a residual against a hard prior is
+        #      meaningless and corrupts fetch_trailing_bias() for every future day.
         if self.ledger.has_calibration_for_date(self.icao, market_date):
             logger.info(
-                f"[SETTLE] Calibration already logged for {market_date} — skipping Task B."
+                f"[SETTLE] {self.icao}: calibration already logged for {market_date} — skipping Task B."
             )
-        elif abs(model_mu - FALLBACK_MU) < 0.01:
+        elif abs(model_mu - self.city_config.hard_prior_mu) < 0.01:
             logger.warning(
-                f"[SETTLE] model_mu={model_mu:.2f} is the fallback prior — "
+                f"[SETTLE] {self.icao}: model_mu={model_mu:.2f} is the fallback prior — "
                 f"Job 2 likely never ran today (check discovery/token_matrix). "
                 f"Skipping calibration write for {market_date} to avoid corrupting trailing bias."
             )
@@ -129,13 +121,13 @@ class SettlementEngine:
                 self.ledger.log_outcome(self.icao, model_mu, actual_temp, market_date=market_date)
                 results["calibration_logged"] = True
                 logger.info(
-                    f"[SETTLE] Calibration written: date={market_date} "
+                    f"[SETTLE] {self.icao}: calibration written: date={market_date} "
                     f"model_mu={model_mu:.2f} actual={actual_temp:.2f} "
                     f"residual={actual_temp - model_mu:+.2f}°C"
                 )
             else:
                 logger.warning(
-                    f"[SETTLE] Could not fetch actual temp for {market_date} — "
+                    f"[SETTLE] {self.icao}: could not fetch actual temp for {market_date} — "
                     f"calibration not written. Will retry next cycle."
                 )
 
@@ -180,7 +172,7 @@ class SettlementEngine:
                 return False  # Not yet terminal
 
             logger.info(
-                f"[SETTLE] {bracket_label} resolved {outcome} "
+                f"[SETTLE] {self.icao} {bracket_label} resolved {outcome} "
                 f"(outcomePrices[0]={yes_price:.4f})"
             )
 
@@ -189,26 +181,30 @@ class SettlementEngine:
                 date          = market_date or market.get("endDate", "")[:10],
                 bracket_label = bracket_label,
                 outcome       = outcome,
+                icao          = self.icao,
             )
             return True
 
         except Exception as e:
-            logger.error(f"[SETTLE] Resolution check failed for {bracket_label}: {e}")
+            logger.error(f"[SETTLE] {self.icao}: resolution check failed for {bracket_label}: {e}")
             return False
 
     def _fetch_actual_temperature(self, date: str) -> Optional[float]:
         """
-        Fetch the true observed daily maximum temperature at WSSS.
+        Fetch the true observed daily maximum temperature at this city.
 
-        Primary: Open-Meteo historical archive (reanalysis, reliable after ~6h lag).
-        Fallback: NEA data.gov.sg air temperature readings for Changi S24.
+        Primary: Open-Meteo historical archive (reanalysis, reliable after ~6h lag) —
+        generic by lat/lon, works for any configured city.
+        Fallback: city_config.official_station_fetcher, if the city has one
+        configured (e.g. WSSS uses NEA Changi station S24). Cities without an
+        override simply rely on Open-Meteo archive alone.
 
         This is the critical fix over v4.2's settlement inference:
         We get the real number, not a bracket midpoint proxy.
         """
         # ── Primary: Open-Meteo archive ───────────────────────────────────────
         try:
-            url  = OPEN_METEO_HIST_URL.format(date=date)
+            url  = OPEN_METEO_HIST_URL.format(lat=self.city_config.lat, lon=self.city_config.lon, date=date)
             resp = requests.get(url, timeout=self.timeout)
             resp.raise_for_status()
             data = resp.json()
@@ -216,35 +212,20 @@ class SettlementEngine:
             t_max_arr = data.get("daily", {}).get("temperature_2m_max", [])
             if t_max_arr and t_max_arr[0] is not None:
                 actual = float(t_max_arr[0])
-                logger.info(f"[SETTLE] Open-Meteo archive: actual max = {actual:.2f}°C")
+                logger.info(f"[SETTLE] {self.icao}: Open-Meteo archive actual max = {actual:.2f}°C")
                 return actual
 
         except Exception as e:
-            logger.warning(f"[SETTLE] Open-Meteo archive failed: {e} — trying NEA")
+            logger.warning(f"[SETTLE] {self.icao}: Open-Meteo archive failed: {e}")
 
-        # ── Fallback: NEA data.gov.sg ─────────────────────────────────────────
-        try:
-            url  = NEA_READINGS_URL.format(date=date)
-            resp = requests.get(url, timeout=self.timeout)
-            resp.raise_for_status()
-            data = resp.json()
-
-            readings = data.get("items", [])
-            changi_max = None
-
-            for item in readings:
-                for reading in item.get("readings", []):
-                    if reading.get("station_id") == CHANGI_STATION_ID:
-                        val = reading.get("value")
-                        if val is not None:
-                            changi_max = max(changi_max or 0.0, float(val))
-
-            if changi_max is not None:
-                logger.info(f"[SETTLE] NEA Changi actual max = {changi_max:.2f}°C")
-                return changi_max
-
-        except Exception as e:
-            logger.error(f"[SETTLE] NEA fallback also failed: {e}")
+        # ── Optional fallback: city-specific official station ────────────────
+        if self.city_config.official_station_fetcher is not None:
+            try:
+                actual = self.city_config.official_station_fetcher(date, self.timeout)
+                if actual is not None:
+                    return actual
+            except Exception as e:
+                logger.error(f"[SETTLE] {self.icao}: official station fallback failed: {e}")
 
         return None
 
