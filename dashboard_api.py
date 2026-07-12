@@ -36,13 +36,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
 from core.model import ECMWF_ENSEMBLE_URL
-from config.cities import CITIES, get_city
+from config.cities import CITIES, get_city, resolve_vault_usd
 
 logger = logging.getLogger("hermes.dashboard_api")
 logging.basicConfig(level=logging.INFO)
 
 DB_PATH        = os.getenv("DB_PATH", "hermes.db")
-VAULT_TOTAL    = float(os.getenv("MAX_VAULT_ALLOCATION", 200.0))
 DEFAULT_ICAO   = "WSSS"
 _DASHBOARD_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
 
@@ -108,10 +107,9 @@ def _scalar(query: str, params: tuple = (), default: Any = 0.0) -> Any:
         return default
 
 def _vault_start(icao: str) -> float:
-    """This city's allocated slice of the total vault."""
+    """This city's own vault size (see config.cities.resolve_vault_usd)."""
     config = CITIES.get(icao.upper())
-    pct = config.vault_allocation_pct if config else 1.0
-    return VAULT_TOTAL * pct
+    return resolve_vault_usd(config) if config else 0.0
 
 # ── API routes ────────────────────────────────────────────────────────────────
 
@@ -120,10 +118,11 @@ def status():
     """Health check + live/mock indicator."""
     live = os.path.exists(DB_PATH)
     sg   = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+    total_vault = sum(resolve_vault_usd(c) for c in CITIES.values())
     return {
         "live":       live,
         "db_path":    DB_PATH,
-        "vault_start": VAULT_TOTAL,
+        "vault_start": total_vault,   # combined across every configured city's own vault
         "sgt_now":    sg.strftime("%Y-%m-%d %H:%M SGT"),
         "utc_now":    datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
     }
@@ -134,10 +133,9 @@ def cities():
     return {
         "cities": [
             {
-                "icao":                 c.icao,
-                "display_name":         c.display_name,
-                "vault_allocation_pct": c.vault_allocation_pct,
-                "vault_start":          _vault_start(c.icao),
+                "icao":         c.icao,
+                "display_name": c.display_name,
+                "vault_start":  _vault_start(c.icao),
             }
             for c in CITIES.values()
         ]

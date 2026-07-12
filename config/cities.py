@@ -8,11 +8,16 @@ CityConfig entry. Core trading modules (core/model.py, core/discovery.py,
 core/settlement.py) take a CityConfig instead of reading module-level
 globals, so adding a new city is a config-only change.
 
-Only WSSS (Singapore) is configured today — Polymarket doesn't yet list
-confirmed weather-bracket markets for other cities. Add a new CITIES
-entry once a matching market exists; no core code changes required.
+WSSS (Singapore) and WMKK (Kuala Lumpur) are configured. WMKK's slug
+template, bracket range, and skew table are best-effort estimates (mirrored
+from WSSS's tropical-climate pattern) since no confirmed Polymarket
+"highest temperature in Kuala Lumpur" market has been observed yet —
+verify/adjust gamma_slug_template and title_keywords against the live
+market before relying on discovery to find it. Add further CITIES entries
+the same way; no core code changes required.
 """
 
+import os
 import logging
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
@@ -35,10 +40,37 @@ class CityConfig:
     bracket_bounds:      Dict[str, Tuple[float, float]]  # label -> (lo, hi), upper exclusive
     skew_alpha_by_month: Dict[int, float]
     default_skew_alpha:  float
-    vault_allocation_pct: float                      # fraction of total vault this city may use
+    # Each city has its OWN vault, sized independently — not a percentage
+    # split of one shared pool. default_vault_usd is the fallback used when
+    # no VAULT_USD_<ICAO> env var is set (see resolve_vault_usd() below).
+    default_vault_usd:  float
     hard_prior_mu:       float                       # fallback forecast mean if all upstream fails
     hard_prior_sigma:    float
     official_station_fetcher: Optional[Callable[[str, int], Optional[float]]] = None
+
+
+def resolve_vault_usd(config: "CityConfig") -> float:
+    """
+    Resolve this city's own vault size, dynamically configurable per-city
+    via env var VAULT_USD_<ICAO> (e.g. VAULT_USD_WSSS=200, VAULT_USD_WMKK=100),
+    falling back to CityConfig.default_vault_usd if unset.
+
+    Legacy fallback: WSSS alone also honors the original MAX_VAULT_ALLOCATION
+    env var (pre-multi-city name) if VAULT_USD_WSSS isn't set, so existing
+    single-city .env deployments keep their configured vault size unchanged.
+    """
+    icao = config.icao.upper()
+    env_key = f"VAULT_USD_{icao}"
+    raw = os.getenv(env_key)
+    if raw:
+        return float(raw)
+
+    if icao == "WSSS":
+        legacy = os.getenv("MAX_VAULT_ALLOCATION")
+        if legacy:
+            return float(legacy)
+
+    return config.default_vault_usd
 
 
 # ── WSSS: NEA Changi (S24) official-station override ─────────────────────────
@@ -103,10 +135,58 @@ CITIES: Dict[str, CityConfig] = {
             11: -1.0, 12: -1.0,
         },
         default_skew_alpha=-1.5,
-        vault_allocation_pct=1.0,
+        # Own vault, independent of WMKK's — override via VAULT_USD_WSSS
+        # (or the legacy MAX_VAULT_ALLOCATION env var) without touching code.
+        default_vault_usd=200.0,
         hard_prior_mu=31.5,
         hard_prior_sigma=1.0,
         official_station_fetcher=fetch_nea_changi,
+    ),
+    "WMKK": CityConfig(
+        icao="WMKK",
+        display_name="Kuala Lumpur",
+        # Kuala Lumpur International Airport (Sepang) — the standard ICAO
+        # station for "Kuala Lumpur" in aviation/weather datasets.
+        lat=2.7456,
+        lon=101.7099,
+        timezone="Asia/Kuala_Lumpur",
+        # Best-effort guess mirroring WSSS's confirmed slug pattern — verify
+        # against a live Polymarket "highest temperature in Kuala Lumpur"
+        # event before relying on this for discovery.
+        gamma_slug_template="highest-temperature-in-kuala-lumpur-on-{month}-{day}-{year}",
+        title_keywords=["kuala lumpur", "temperature"],
+        # KL's equatorial climate runs slightly hotter than Singapore's —
+        # shifted one degree band up. Also a best-effort guess pending a
+        # real market to calibrate bracket definitions against.
+        bracket_labels=["30°C", "31°C", "32°C", "33°C", "34°C"],
+        bracket_bounds={
+            "30°C": (30.0, 31.0),
+            "31°C": (31.0, 32.0),
+            "32°C": (32.0, 33.0),
+            "33°C": (33.0, 34.0),
+            "34°C": (34.0, 35.0),
+        },
+        # KL's NE monsoon (wet season, Nov-Mar) is milder than Singapore's SW
+        # monsoon skew; dry inter-monsoon months (Jun-Sep, haze-prone) trend
+        # hotter with a heavier left tail. Estimated, not yet calibrated
+        # against real settlement data (see core/settlement.py trailing bias).
+        skew_alpha_by_month={
+            1: -0.8, 2: -0.8,
+            3: -1.0, 4: -1.3,
+            5: -1.5, 6: -1.8,
+            7: -1.8, 8: -1.6,
+            9: -1.4, 10: -1.0,
+            11: -0.8, 12: -0.8,
+        },
+        default_skew_alpha=-1.3,
+        # Own vault, independent of WSSS's — override via VAULT_USD_WMKK.
+        default_vault_usd=100.0,
+        hard_prior_mu=33.0,
+        hard_prior_sigma=1.2,
+        # No official-station override wired yet (Malaysia's Meteorological
+        # Department has no equivalent of NEA's public data.gov.sg API
+        # verified in this codebase) — falls back to Open-Meteo archive only.
+        official_station_fetcher=None,
     ),
 }
 

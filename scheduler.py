@@ -3,10 +3,12 @@ scheduler.py — S2: APScheduler round-the-clock job architecture, multi-city
 
 v5.0 — generalized to run N cities in one process. Each city in
 config.cities.CITIES gets its own CityRunner (core/city_runner.py) with its
-own in-process _state, but all runners share one Ledger (hermes.db), one
-CLOB client, and one vault split by each city's config.vault_allocation_pct.
-Only WSSS is configured today; adding a city is a config.cities.py change,
-not a scheduler change — every job here just loops over CITIES.
+own in-process _state AND its own independently-sized vault (see
+config.cities.resolve_vault_usd — dynamically configurable per city via a
+VAULT_USD_<ICAO> env var, not a percentage split of one shared pool).
+Runners share one Ledger (hermes.db) and one CLOB client. Adding a city is
+a config.cities.py change, not a scheduler change — every job here just
+loops over CITIES.
 
 v4.6 REDESIGN — round-the-clock coverage to match how Polymarket weather
 markets actually trade. Confirmed from live observation across a prior
@@ -86,11 +88,10 @@ from db.ledger        import Ledger
 from core.execution    import build_client
 from core.sizing       import check_sizing_config
 from core.city_runner  import CityRunner
-from config.cities     import CITIES
+from config.cities     import CITIES, resolve_vault_usd
 
 # ── Config from environment ────────────────────────────────────────────────────
 DB_PATH        = os.getenv("DB_PATH",              "hermes.db")
-VAULT_USD      = float(os.getenv("MAX_VAULT_ALLOCATION") or 200.0)
 EDGE_THRESHOLD = float(os.getenv("EDGE_THRESHOLD", 0.05))
 TRAIL_PCT      = float(os.getenv("TRAIL_PCT", 0.20))
 
@@ -108,22 +109,20 @@ _runners: dict = {}   # icao -> CityRunner, populated in main()
 
 
 def _build_runners() -> dict:
-    """One CityRunner per configured city, each allocated its slice of VAULT_USD."""
+    """One CityRunner per configured city, each sized against its own vault
+    (see config.cities.resolve_vault_usd — dynamic per-city env override)."""
     runners = {}
     for icao, config in CITIES.items():
-        allocated_vault = VAULT_USD * config.vault_allocation_pct
+        vault_usd = resolve_vault_usd(config)
         runners[icao] = CityRunner(
             config          = config,
             ledger          = _ledger,
-            vault_usd       = allocated_vault,
+            vault_usd       = vault_usd,
             edge_threshold  = EDGE_THRESHOLD,
             trail_pct       = TRAIL_PCT,
             validation_mode = VALIDATION_MODE,
         )
-        logger.info(
-            f"[INIT] City configured: {icao} ({config.display_name}) — "
-            f"vault=${allocated_vault:.2f} ({config.vault_allocation_pct:.0%} of ${VAULT_USD:.0f})"
-        )
+        logger.info(f"[INIT] City configured: {icao} ({config.display_name}) — vault=${vault_usd:.2f}")
     return runners
 
 
@@ -135,9 +134,13 @@ def main():
 
     _runners = _build_runners()
 
+    total_vault = sum(r.vault_usd for r in _runners.values())
     logger.info("═" * 60)
     logger.info(f"  HERMES v5.0 — Multi-City Weather Bracket Trader (round-the-clock)")
-    logger.info(f"  Cities: {', '.join(_runners.keys())} | Vault: ${VAULT_USD:.0f} | Edge threshold: {EDGE_THRESHOLD*100:.0f}%")
+    logger.info(
+        f"  Cities: {', '.join(f'{icao}=${r.vault_usd:.0f}' for icao, r in _runners.items())} "
+        f"(total ${total_vault:.0f}) | Edge threshold: {EDGE_THRESHOLD*100:.0f}%"
+    )
     if VALIDATION_MODE:
         logger.warning("  ⚠️  VALIDATION_MODE ACTIVE — all trades forced to $1, EV gating bypassed")
         logger.warning("  ⚠️  Set VALIDATION_MODE=false in .env to resume normal Kelly sizing")
