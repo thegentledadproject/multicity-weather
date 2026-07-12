@@ -8,17 +8,23 @@ CityConfig entry. Core trading modules (core/model.py, core/discovery.py,
 core/settlement.py) take a CityConfig instead of reading module-level
 globals, so adding a new city is a config-only change.
 
-WSSS (Singapore) and WMKK (Kuala Lumpur) are configured. WMKK's slug
-template, bracket range, and skew table are best-effort estimates (mirrored
-from WSSS's tropical-climate pattern) since no confirmed Polymarket
-"highest temperature in Kuala Lumpur" market has been observed yet —
-verify/adjust gamma_slug_template and title_keywords against the live
-market before relying on discovery to find it. Add further CITIES entries
-the same way; no core code changes required.
+WSSS (Singapore) and WMKK (Kuala Lumpur) are configured.
+
+Bracket ranges (2026-07-12 verification): live Polymarket "highest
+temperature" events use 11 one-degree outcome brackets per day, not 5.
+WSSS's 26-36°C range is confirmed directly (search-engine-cached listings
+for the WSSS event enumerated 26°C through 36°C as outcomes, and one
+resolved at 34°C — outside the old 29-33°C config). WMKK's 27-37°C range
+is NOT independently confirmed the same way — it's the old +1°C shift
+mirrored from WSSS's confirmed range (WMKK's mid-30s brackets like 30-34°C
+did appear in search results, including a confirmed 34°C resolution, but
+the 27-29°C and 35-37°C tail brackets are inferred, not observed). Verify
+the WMKK tails against a live event before relying on them for sizing.
 """
 
 import os
 import logging
+import functools
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -73,10 +79,67 @@ def resolve_vault_usd(config: "CityConfig") -> float:
     return config.default_vault_usd
 
 
-# ── WSSS: NEA Changi (S24) official-station override ─────────────────────────
-# Optional per-city override for SettlementEngine — used only if all
-# generic Open-Meteo archive attempts fail. Other cities default to None
-# (Open-Meteo archive only, per framework design).
+# ── ASOS/METAR station archive — primary official-station source ────────────
+# Polymarket resolves these markets from Wunderground's airport-station
+# history (confirmed 2026-07-12: Wunderground's own market rules text names
+# "Singapore Changi Airport Station" / "Kuala Lumpur Intl Airport Station").
+# Wunderground's airport pages are themselves sourced from the METAR feed for
+# that station's ICAO code — and city_config.icao already *is* that code
+# (WSSS, WMKK are ICAO airport identifiers). The Iowa Environmental Mesonet
+# (mesonet.agron.iastate.edu) mirrors the same global ASOS/METAR network for
+# free with no API key, keyed by ICAO code, so it's usable generically for
+# any city here without a per-country integration.
+#
+# Verified by cross-checking three live Polymarket resolutions against this
+# feed's computed daily max — all matched exactly: WSSS Jul 3 -> 31°C,
+# WSSS Jul 6 -> 32°C, WMKK Jul 8 -> 33°C. This is a closer match to the
+# actual settlement source than Open-Meteo's archive (ERA5 reanalysis grid
+# output, not a station observation) or NEA's data.gov.sg feed (a different
+# station network than the airport METAR Wunderground/Polymarket use).
+ASOS_HOURLY_URL = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
+
+
+def fetch_asos_daily_max(icao: str, timezone: str, date: str, timeout: int = 15) -> Optional[float]:
+    """Daily max temperature (°C) for an ICAO station's local calendar date, from Iowa Mesonet ASOS."""
+    params = {
+        "station": icao,
+        "data": "tmpf",
+        "year1": date[0:4], "month1": date[5:7], "day1": date[8:10],
+        "year2": date[0:4], "month2": date[5:7], "day2": date[8:10],
+        "tz": timezone,
+        "format": "onlycomma",
+        "latlon": "no", "elev": "no",
+        "missing": "M", "trace": "T", "direct": "no",
+    }
+    try:
+        resp = requests.get(ASOS_HOURLY_URL, params=params, timeout=timeout)
+        resp.raise_for_status()
+
+        max_f = None
+        lines = resp.text.strip().splitlines()
+        for line in lines[1:]:  # skip "station,valid,tmpf" header
+            parts = line.strip().split(",")
+            if len(parts) < 3 or parts[2] in ("M", ""):
+                continue
+            try:
+                f_val = float(parts[2])
+            except ValueError:
+                continue
+            max_f = f_val if max_f is None else max(max_f, f_val)
+
+        if max_f is None:
+            return None
+
+        celsius = (max_f - 32.0) * 5.0 / 9.0
+        logger.info(f"[CITIES] ASOS {icao} actual max = {celsius:.2f}°C ({max_f:.1f}°F)")
+        return celsius
+
+    except Exception as e:
+        logger.error(f"[CITIES] ASOS {icao} fetch failed: {e}")
+        return None
+
+
+# ── WSSS: NEA Changi (S24) — secondary fallback behind ASOS ──────────────────
 NEA_READINGS_URL = "https://api.data.gov.sg/v1/environment/air-temperature?date={date}"
 CHANGI_STATION_ID = "S24"
 
@@ -106,6 +169,14 @@ def fetch_nea_changi(date: str, timeout: int = 15) -> Optional[float]:
         return None
 
 
+def _wsss_official_fetcher(date: str, timeout: int = 15) -> Optional[float]:
+    """ASOS (WSSS/Changi) primary, NEA Changi S24 secondary if ASOS has no reading for the date."""
+    asos = fetch_asos_daily_max("WSSS", "Asia/Singapore", date, timeout)
+    if asos is not None:
+        return asos
+    return fetch_nea_changi(date, timeout)
+
+
 CITIES: Dict[str, CityConfig] = {
     "WSSS": CityConfig(
         icao="WSSS",
@@ -115,13 +186,22 @@ CITIES: Dict[str, CityConfig] = {
         timezone="Asia/Singapore",
         gamma_slug_template="highest-temperature-in-singapore-on-{month}-{day}-{year}",
         title_keywords=["singapore", "temperature"],
-        bracket_labels=["29°C", "30°C", "31°C", "32°C", "33°C"],
+        # Full 11-outcome range confirmed live (2026-07-12) — Polymarket's
+        # WSSS event lists 26°C through 36°C, not just the 29-33°C middle
+        # band this config used to define.
+        bracket_labels=["26°C", "27°C", "28°C", "29°C", "30°C", "31°C", "32°C", "33°C", "34°C", "35°C", "36°C"],
         bracket_bounds={
+            "26°C": (26.0, 27.0),
+            "27°C": (27.0, 28.0),
+            "28°C": (28.0, 29.0),
             "29°C": (29.0, 30.0),
             "30°C": (30.0, 31.0),
             "31°C": (31.0, 32.0),
             "32°C": (32.0, 33.0),
             "33°C": (33.0, 34.0),
+            "34°C": (34.0, 35.0),
+            "35°C": (35.0, 36.0),
+            "36°C": (36.0, 37.0),
         },
         # Negative = left skew (colder tail heavier). SW monsoon months
         # (May-Sep): stronger left skew. Moved verbatim from core/model.py's
@@ -140,7 +220,7 @@ CITIES: Dict[str, CityConfig] = {
         default_vault_usd=200.0,
         hard_prior_mu=31.5,
         hard_prior_sigma=1.0,
-        official_station_fetcher=fetch_nea_changi,
+        official_station_fetcher=_wsss_official_fetcher,
     ),
     "WMKK": CityConfig(
         icao="WMKK",
@@ -156,15 +236,24 @@ CITIES: Dict[str, CityConfig] = {
         gamma_slug_template="highest-temperature-in-kuala-lumpur-on-{month}-{day}-{year}",
         title_keywords=["kuala lumpur", "temperature"],
         # KL's equatorial climate runs slightly hotter than Singapore's —
-        # shifted one degree band up. Also a best-effort guess pending a
-        # real market to calibrate bracket definitions against.
-        bracket_labels=["30°C", "31°C", "32°C", "33°C", "34°C"],
+        # shifted one degree band up, mirroring WSSS's confirmed 26-36°C
+        # range to 27-37°C. The 30-34°C middle brackets appeared in live
+        # search results (including a confirmed 34°C resolution on Jul 9,
+        # 2026); the 27-29°C and 35-37°C tails are inferred from the shift
+        # pattern, not independently observed — verify against a live event.
+        bracket_labels=["27°C", "28°C", "29°C", "30°C", "31°C", "32°C", "33°C", "34°C", "35°C", "36°C", "37°C"],
         bracket_bounds={
+            "27°C": (27.0, 28.0),
+            "28°C": (28.0, 29.0),
+            "29°C": (29.0, 30.0),
             "30°C": (30.0, 31.0),
             "31°C": (31.0, 32.0),
             "32°C": (32.0, 33.0),
             "33°C": (33.0, 34.0),
             "34°C": (34.0, 35.0),
+            "35°C": (35.0, 36.0),
+            "36°C": (36.0, 37.0),
+            "37°C": (37.0, 38.0),
         },
         # KL's NE monsoon (wet season, Nov-Mar) is milder than Singapore's SW
         # monsoon skew; dry inter-monsoon months (Jun-Sep, haze-prone) trend
@@ -183,10 +272,11 @@ CITIES: Dict[str, CityConfig] = {
         default_vault_usd=100.0,
         hard_prior_mu=33.0,
         hard_prior_sigma=1.2,
-        # No official-station override wired yet (Malaysia's Meteorological
-        # Department has no equivalent of NEA's public data.gov.sg API
-        # verified in this codebase) — falls back to Open-Meteo archive only.
-        official_station_fetcher=None,
+        # ASOS/METAR archive for WMKK (KL Intl Airport) — confirmed exact
+        # match against a live Polymarket resolution (Jul 8, 2026 -> 33°C).
+        # No Malaysian government equivalent of NEA's data.gov.sg API is
+        # wired, so this is the only official-station source for WMKK.
+        official_station_fetcher=functools.partial(fetch_asos_daily_max, "WMKK", "Asia/Kuala_Lumpur"),
     ),
 }
 

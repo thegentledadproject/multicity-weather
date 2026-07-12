@@ -17,14 +17,22 @@ the early hours of the next):
     if configured) → write calibration residual to ledger.
 
   Task B — Actual temperature fetch (separate from resolution):
-    Uses Open-Meteo historical archive API to get the true observed
-    daily max at the city's coordinates. This is written to
-    calibration_logs regardless of whether we had an open position — it
-    feeds the trailing bias.
+    Fetches the true observed daily max at the city's coordinates and
+    writes it to calibration_logs regardless of whether we had an open
+    position — it feeds the trailing bias.
 
     THIS IS THE FIX for the settlement inference bug:
     We do NOT infer actual temp from the bracket midpoint.
-    We fetch it directly from a meteorological archive.
+    We fetch it directly from a meteorological source.
+
+  Source order (2026-07-12 revision): city_config.official_station_fetcher
+    is now tried FIRST, not last. For WSSS/WMKK this is an ASOS/METAR
+    archive fetch keyed by the city's own ICAO code — confirmed (by
+    cross-checking three live Polymarket resolutions) to match the actual
+    Wunderground-sourced settlement value exactly. Open-Meteo's historical
+    archive (a gridded reanalysis model, not a station observation) is only
+    a fallback for cities without a station fetcher configured, or when the
+    station fetcher has no reading for the date.
 """
 
 import json
@@ -193,16 +201,27 @@ class SettlementEngine:
         """
         Fetch the true observed daily maximum temperature at this city.
 
-        Primary: Open-Meteo historical archive (reanalysis, reliable after ~6h lag) —
-        generic by lat/lon, works for any configured city.
-        Fallback: city_config.official_station_fetcher, if the city has one
-        configured (e.g. WSSS uses NEA Changi station S24). Cities without an
-        override simply rely on Open-Meteo archive alone.
+        Primary: city_config.official_station_fetcher, if configured (WSSS/WMKK
+        both use an ASOS/METAR archive fetch keyed by ICAO code — confirmed to
+        match Polymarket's actual Wunderground-sourced settlement value exactly,
+        since Wunderground's airport-station pages are themselves METAR-derived).
+        Fallback: Open-Meteo historical archive (gridded reanalysis, not a station
+        observation — used when no station fetcher is configured, or it has no
+        reading for the date).
 
         This is the critical fix over v4.2's settlement inference:
         We get the real number, not a bracket midpoint proxy.
         """
-        # ── Primary: Open-Meteo archive ───────────────────────────────────────
+        # ── Primary: city-specific official station (ASOS/METAR, etc.) ───────
+        if self.city_config.official_station_fetcher is not None:
+            try:
+                actual = self.city_config.official_station_fetcher(date, self.timeout)
+                if actual is not None:
+                    return actual
+            except Exception as e:
+                logger.error(f"[SETTLE] {self.icao}: official station fetch failed: {e}")
+
+        # ── Fallback: Open-Meteo archive ──────────────────────────────────────
         try:
             url  = OPEN_METEO_HIST_URL.format(lat=self.city_config.lat, lon=self.city_config.lon, date=date)
             resp = requests.get(url, timeout=self.timeout)
@@ -217,15 +236,6 @@ class SettlementEngine:
 
         except Exception as e:
             logger.warning(f"[SETTLE] {self.icao}: Open-Meteo archive failed: {e}")
-
-        # ── Optional fallback: city-specific official station ────────────────
-        if self.city_config.official_station_fetcher is not None:
-            try:
-                actual = self.city_config.official_station_fetcher(date, self.timeout)
-                if actual is not None:
-                    return actual
-            except Exception as e:
-                logger.error(f"[SETTLE] {self.icao}: official station fallback failed: {e}")
 
         return None
 
