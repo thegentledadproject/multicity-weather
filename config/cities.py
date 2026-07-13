@@ -10,16 +10,15 @@ globals, so adding a new city is a config-only change.
 
 WSSS (Singapore) and WMKK (Kuala Lumpur) are configured.
 
-Bracket ranges (2026-07-12 verification): live Polymarket "highest
-temperature" events use 11 one-degree outcome brackets per day, not 5.
-WSSS's 26-36°C range is confirmed directly (search-engine-cached listings
-for the WSSS event enumerated 26°C through 36°C as outcomes, and one
-resolved at 34°C — outside the old 29-33°C config). WMKK's 27-37°C range
-is NOT independently confirmed the same way — it's the old +1°C shift
-mirrored from WSSS's confirmed range (WMKK's mid-30s brackets like 30-34°C
-did appear in search results, including a confirmed 34°C resolution, but
-the 27-29°C and 35-37°C tail brackets are inferred, not observed). Verify
-the WMKK tails against a live event before relying on them for sizing.
+Bracket ranges (2026-07-12 verification, corrected same day): live
+Polymarket "highest temperature" events use 11 outcome brackets per day,
+not 5, and BOTH cities use the identical 26-36°C range — confirmed
+directly via a live market slug,
+"highest-temperature-in-kuala-lumpur-on-july-6-2026-26corbelow" i.e.
+"26°C or below" — so WMKK is NOT shifted +1°C from WSSS as an earlier
+pass here assumed. The two tail brackets are open-ended catch-alls
+("26°C or below" / "36°C or above"), not narrow 1-degree bins like the 9
+middle brackets — bracket_bounds reflects that with -inf/+inf edges.
 """
 
 import os
@@ -188,10 +187,11 @@ CITIES: Dict[str, CityConfig] = {
         title_keywords=["singapore", "temperature"],
         # Full 11-outcome range confirmed live (2026-07-12) — Polymarket's
         # WSSS event lists 26°C through 36°C, not just the 29-33°C middle
-        # band this config used to define.
+        # band this config used to define. Tails are open-ended catch-alls
+        # ("26°C or below" / "36°C or above"), not narrow 1-degree bins.
         bracket_labels=["26°C", "27°C", "28°C", "29°C", "30°C", "31°C", "32°C", "33°C", "34°C", "35°C", "36°C"],
         bracket_bounds={
-            "26°C": (26.0, 27.0),
+            "26°C": (float("-inf"), 27.0),
             "27°C": (27.0, 28.0),
             "28°C": (28.0, 29.0),
             "29°C": (29.0, 30.0),
@@ -201,7 +201,7 @@ CITIES: Dict[str, CityConfig] = {
             "33°C": (33.0, 34.0),
             "34°C": (34.0, 35.0),
             "35°C": (35.0, 36.0),
-            "36°C": (36.0, 37.0),
+            "36°C": (36.0, float("inf")),
         },
         # Negative = left skew (colder tail heavier). SW monsoon months
         # (May-Sep): stronger left skew. Moved verbatim from core/model.py's
@@ -230,19 +230,19 @@ CITIES: Dict[str, CityConfig] = {
         lat=2.7456,
         lon=101.7099,
         timezone="Asia/Kuala_Lumpur",
-        # Best-effort guess mirroring WSSS's confirmed slug pattern — verify
-        # against a live Polymarket "highest temperature in Kuala Lumpur"
-        # event before relying on this for discovery.
+        # Confirmed against live Polymarket events (2026-07-12): matches
+        # highest-temperature-in-kuala-lumpur-on-july-{d}-{yyyy} exactly.
         gamma_slug_template="highest-temperature-in-kuala-lumpur-on-{month}-{day}-{year}",
         title_keywords=["kuala lumpur", "temperature"],
-        # KL's equatorial climate runs slightly hotter than Singapore's —
-        # shifted one degree band up, mirroring WSSS's confirmed 26-36°C
-        # range to 27-37°C. The 30-34°C middle brackets appeared in live
-        # search results (including a confirmed 34°C resolution on Jul 9,
-        # 2026); the 27-29°C and 35-37°C tails are inferred from the shift
-        # pattern, not independently observed — verify against a live event.
-        bracket_labels=["27°C", "28°C", "29°C", "30°C", "31°C", "32°C", "33°C", "34°C", "35°C", "36°C", "37°C"],
+        # NOT shifted from WSSS — confirmed live (2026-07-12) via a real
+        # market slug, "...-on-july-6-2026-26corbelow" ("26°C or below"),
+        # that WMKK uses the SAME 26-36°C range as WSSS despite KL's higher
+        # average climate. An earlier pass here guessed a +1°C shift
+        # (27-37°C); that was wrong and has been corrected. Tails are
+        # open-ended catch-alls, same as WSSS.
+        bracket_labels=["26°C", "27°C", "28°C", "29°C", "30°C", "31°C", "32°C", "33°C", "34°C", "35°C", "36°C"],
         bracket_bounds={
+            "26°C": (float("-inf"), 27.0),
             "27°C": (27.0, 28.0),
             "28°C": (28.0, 29.0),
             "29°C": (29.0, 30.0),
@@ -252,8 +252,7 @@ CITIES: Dict[str, CityConfig] = {
             "33°C": (33.0, 34.0),
             "34°C": (34.0, 35.0),
             "35°C": (35.0, 36.0),
-            "36°C": (36.0, 37.0),
-            "37°C": (37.0, 38.0),
+            "36°C": (36.0, float("inf")),
         },
         # KL's NE monsoon (wet season, Nov-Mar) is milder than Singapore's SW
         # monsoon skew; dry inter-monsoon months (Jun-Sep, haze-prone) trend
