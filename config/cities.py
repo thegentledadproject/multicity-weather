@@ -228,6 +228,11 @@ CITIES: Dict[str, CityConfig] = {
         hard_prior_mu=31.5,
         hard_prior_sigma=1.0,
         official_station_fetcher=_wsss_official_fetcher,
+        # Paper trading, same as WMKK (see CityConfig.paper_trading) — its
+        # bracket range/settlement source were both corrected this session
+        # (5->11 brackets, ASOS/METAR settlement), so re-validate against
+        # live prices before resuming real capital. Flip to False once satisfied.
+        paper_trading=True,
     ),
     "WMKK": CityConfig(
         icao="WMKK",

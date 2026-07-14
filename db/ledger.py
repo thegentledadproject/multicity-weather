@@ -486,6 +486,11 @@ class Ledger:
                     "SELECT * FROM exit_log WHERE market_date = ? ORDER BY id DESC",
                     (date,),
                 ).fetchall()
+            if icao:
+                return conn.execute(
+                    "SELECT * FROM exit_log WHERE icao_code = ? ORDER BY id DESC",
+                    (icao.upper(),),
+                ).fetchall()
             return conn.execute(
                 "SELECT * FROM exit_log ORDER BY id DESC LIMIT 100"
             ).fetchall()
