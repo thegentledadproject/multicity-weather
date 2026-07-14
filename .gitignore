@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+
+hermes.db
+hermes.log
+hermes_preview.db
