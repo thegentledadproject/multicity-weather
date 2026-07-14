@@ -52,6 +52,13 @@ class CityConfig:
     hard_prior_mu:       float                       # fallback forecast mean if all upstream fails
     hard_prior_sigma:    float
     official_station_fetcher: Optional[Callable[[str, int], Optional[float]]] = None
+    # When True, core/execution.py and core/position_monitor.py still fetch
+    # live order books (for realistic fill prices) but skip real order
+    # placement entirely — no CLOB order is ever created or posted, so no
+    # real capital is at risk. Positions/exits are recorded normally with
+    # is_paper=1 so the dashboard can show simulated results without mixing
+    # them into any city's real vault P&L (see dashboard_api.py's _is_paper).
+    paper_trading:       bool = False
 
 
 def resolve_vault_usd(config: "CityConfig") -> float:
@@ -276,6 +283,12 @@ CITIES: Dict[str, CityConfig] = {
         # No Malaysian government equivalent of NEA's data.gov.sg API is
         # wired, so this is the only official-station source for WMKK.
         official_station_fetcher=functools.partial(fetch_asos_daily_max, "WMKK", "Asia/Kuala_Lumpur"),
+        # WMKK is new/unproven (bracket ranges and skew table only recently
+        # verified, no live trading history) — paper trading first to prove
+        # the full pipeline against real market prices before risking capital.
+        # Flip to False once satisfied, or set VAULT_USD_WMKK and this flag
+        # together when going live.
+        paper_trading=True,
     ),
 }
 

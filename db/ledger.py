@@ -68,7 +68,8 @@ class Ledger:
                     size_usd        REAL    NOT NULL,
                     opened_at       TEXT    NOT NULL,
                     peak_price      REAL    NOT NULL DEFAULT 0.0,
-                    market_date     TEXT    NOT NULL DEFAULT ''
+                    market_date     TEXT    NOT NULL DEFAULT '',
+                    is_paper        INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS signal_log (
@@ -108,7 +109,8 @@ class Ledger:
                     size_usd        REAL    NOT NULL,
                     realised_pnl    REAL    NOT NULL,
                     opened_at       TEXT    NOT NULL,
-                    closed_at       TEXT    NOT NULL
+                    closed_at       TEXT    NOT NULL,
+                    is_paper        INTEGER NOT NULL DEFAULT 0
                 );
             """)
             conn.commit()
@@ -138,6 +140,13 @@ class Ledger:
                 if col not in cols:
                     logger.info(f"[LEDGER] Migrating: adding {col} to {table}")
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT NOT NULL DEFAULT {default}")
+
+            # is_paper: INTEGER, not TEXT like the loop above — separate pass.
+            for table in ("open_positions", "exit_log"):
+                cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})")]
+                if "is_paper" not in cols:
+                    logger.info(f"[LEDGER] Migrating: adding is_paper to {table}")
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN is_paper INTEGER NOT NULL DEFAULT 0")
 
             # token_matrix: pre-multi-city DBs have bracket_label as sole PRIMARY
             # KEY, which collides once a second city trades an overlapping
@@ -280,6 +289,7 @@ class Ledger:
     def record_position(
         self, token_id: str, label: str, icao: str,
         entry_price: float, size_usd: float, market_date: str = "",
+        is_paper: bool = False,
     ):
         """
         market_date: SGT calendar date this position was opened under.
@@ -289,6 +299,11 @@ class Ledger:
         00:00-07:59 SGT mismatch window that affected calibration_logs and
         exit_log applies here too (a position opened at 06:00 SGT stores a
         UTC timestamp dated the PREVIOUS calendar day).
+
+        is_paper: True if this fill was simulated (config.paper_trading),
+        not a real CLOB order. See dashboard_api.py's _is_paper() — real
+        vault/P&L aggregates filter on this so simulated results never mix
+        into a city's real money figures.
         """
         ts = datetime.datetime.utcnow().isoformat()
         if not market_date:
@@ -301,13 +316,13 @@ class Ledger:
             conn.execute(
                 "INSERT OR REPLACE INTO open_positions "
                 "(token_id, bracket_label, icao_code, entry_price, size_usd, "
-                " opened_at, peak_price, market_date) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                " opened_at, peak_price, market_date, is_paper) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (token_id, label, icao.upper(), entry_price, size_usd, ts,
-                 entry_price, market_date),
+                 entry_price, market_date, int(is_paper)),
             )
         logger.info(
-            f"[LEDGER] Position open: {label} @ {entry_price:.4f} "
+            f"[LEDGER] {'PAPER ' if is_paper else ''}Position open: {label} @ {entry_price:.4f} "
             f"${size_usd:.2f} (market_date={market_date})"
         )
 
@@ -421,6 +436,7 @@ class Ledger:
         opened_at:    str,
         market_date:  str = "",
         icao:         str = "WSSS",
+        is_paper:     bool = False,
     ):
         """
         Record a completed position exit with P&L.
@@ -431,6 +447,9 @@ class Ledger:
         write timestamp so daily_pnl() and get_exit_log(date=...) are
         correct for exits that happen between 00:00-07:59 SGT (whose UTC
         timestamp falls on the previous calendar date).
+
+        is_paper: see record_position() — carried through from the position
+        that's being closed so exit_log rows stay consistent with how they opened.
         """
         ts = datetime.datetime.utcnow().isoformat()
         if not market_date:
@@ -443,14 +462,14 @@ class Ledger:
             conn.execute(
                 "INSERT INTO exit_log "
                 "(timestamp, market_date, icao_code, token_id, bracket_label, direction, reason, "
-                " entry_price, exit_price, size_usd, realised_pnl, opened_at, closed_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " entry_price, exit_price, size_usd, realised_pnl, opened_at, closed_at, is_paper) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (ts, market_date, icao.upper(), token_id, bracket_label, direction, reason,
-                 entry_price, exit_price, size_usd, realised_pnl, opened_at, ts),
+                 entry_price, exit_price, size_usd, realised_pnl, opened_at, ts, int(is_paper)),
             )
         pnl_pct = (realised_pnl / size_usd * 100) if size_usd else 0.0
         logger.info(
-            f"[LEDGER] Exit logged: {bracket_label} [{direction}] "
+            f"[LEDGER] {'PAPER ' if is_paper else ''}Exit logged: {bracket_label} [{direction}] "
             f"reason={reason} P&L={realised_pnl:+.4f} ({pnl_pct:+.1f}%)"
         )
 

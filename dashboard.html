@@ -135,6 +135,8 @@
   .badge-pass   { background: rgba(34,197,94,.18);  color: var(--green); }
   .badge-hold   { background: rgba(110,118,129,.20); color: var(--muted); }
   .badge-gated  { background: rgba(245,158,11,.15); color: var(--amber); }
+  .badge-paper  { background: rgba(245,158,11,.18); color: var(--amber);
+                  border: 1px solid var(--amber); letter-spacing: 1px; }
   .row-pass td  { background: rgba(34,197,94,.04); }
 
   @media (max-width: 900px) {
@@ -417,10 +419,11 @@ function renderOverview(d) {
   }
   grid.innerHTML = d.cities.map(c => {
     const roiCls = c.roi_pct >= 0 ? "positive" : "negative";
+    const paperBadge = c.paper_trading ? '<span class="badge badge-paper">PAPER</span> ' : "";
     return `
 <div class="city-card" onclick="showCity('${c.icao}')">
   <div class="city-card-top">
-    <span class="city-card-name">${c.display_name}</span>
+    <span class="city-card-name">${paperBadge}${c.display_name}</span>
     <span class="city-card-icao">${c.icao}</span>
   </div>
   <div class="city-card-stats">
@@ -450,8 +453,9 @@ function showOverview() {
 function showCity(icao) {
   currentIcao = icao;
   const city = cityRegistry.find(c => c.icao === icao);
+  const paperBadge = city && city.paper_trading ? ' <span class="badge badge-paper">PAPER TRADING</span>' : "";
   document.getElementById("page-title").innerHTML =
-    (city ? city.display_name : icao) + ' Weather Bracket Arb <span style="color:var(--muted);font-weight:400;font-size:16px">· Live Dashboard</span>';
+    (city ? city.display_name : icao) + ' Weather Bracket Arb <span style="color:var(--muted);font-weight:400;font-size:16px">· Live Dashboard</span>' + paperBadge;
   document.getElementById("footer-city").textContent = (city ? city.display_name : icao) + " (" + icao + ")";
   document.getElementById("overview-view").style.display = "none";
   document.getElementById("detail-view").style.display = "";

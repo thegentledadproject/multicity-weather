@@ -372,12 +372,17 @@ class PositionMonitor:
         edge_threshold: float = EDGE_THRESHOLD,
         trail_pct:      float = TRAIL_PCT,
         icao:           str   = "WSSS",
+        paper_trading:  bool  = False,
     ):
         self.client         = client
         self.ledger         = ledger
         self.edge_threshold = edge_threshold
         self.trail_pct      = trail_pct
         self.icao           = icao
+        # See config.cities.CityConfig.paper_trading / ExecutionEngine —
+        # exit order book is still fetched for a realistic exit price, but
+        # no real order is created or posted when this is True.
+        self.paper_trading  = paper_trading
 
     def run(self, model_probs: Dict[str, float], market_date: str = "") -> List[Dict]:
         """
@@ -563,15 +568,26 @@ class PositionMonitor:
         else:
             order_amount = round(shares_held * exit_vwap, 2)
 
-        try:
-            signed = self.client.create_market_order(MarketOrderArgs(
-                token_id=token_id, amount=order_amount, price=exit_vwap, side=clob_side,
-            ))
-            response = self.client.post_order(signed, OrderType.FOK)
-            filled   = _parse_fill(response, label)
-        except Exception as e:
-            logger.error(f"[MONITOR] {label}: exit order error: {e}")
-            return self._result(decision, size_usd, opened_at, exit_vwap, False, f"order_error:{e}")
+        # Paper trading: book fetch + VWAP walk above already used LIVE prices,
+        # so simulate the fill at exit_vwap rather than a fabricated number —
+        # only the real order write is skipped.
+        if self.paper_trading:
+            logger.info(
+                f"[MONITOR] 📝 PAPER exit {label} [{direction}] {reason} "
+                f"@ {exit_vwap:.4f} (no real order placed)"
+            )
+            filled   = True
+            response = None
+        else:
+            try:
+                signed = self.client.create_market_order(MarketOrderArgs(
+                    token_id=token_id, amount=order_amount, price=exit_vwap, side=clob_side,
+                ))
+                response = self.client.post_order(signed, OrderType.FOK)
+                filled   = _parse_fill(response, label)
+            except Exception as e:
+                logger.error(f"[MONITOR] {label}: exit order error: {e}")
+                return self._result(decision, size_usd, opened_at, exit_vwap, False, f"order_error:{e}")
 
         if filled:
             if direction == "BUY":
@@ -591,7 +607,7 @@ class PositionMonitor:
                 reason=reason, entry_price=decision.entry_price,
                 exit_price=exit_vwap, size_usd=size_usd,
                 realised_pnl=realised_pnl, opened_at=opened_at,
-                market_date=market_date, icao=self.icao,
+                market_date=market_date, icao=self.icao, is_paper=self.paper_trading,
             )
             return self._result(decision, size_usd, opened_at, exit_vwap, True, reason, realised_pnl)
 

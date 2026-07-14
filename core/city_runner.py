@@ -185,7 +185,8 @@ class CityRunner:
     # ══════════════════════════════════════════════════════════════════════
     def job_order_execution(self):
         local_now_str = self._local_now().strftime("%H:%M %Z")
-        logger.info(f"[JOB3:{self.icao}] ── Order Execution @ {local_now_str} ──")
+        mode = " [PAPER TRADING — no real orders]" if self.config.paper_trading else ""
+        logger.info(f"[JOB3:{self.icao}] ── Order Execution @ {local_now_str}{mode} ──")
 
         if self.client is None:
             logger.error(f"[JOB3:{self.icao}] CLOB client not initialised — skipping.")
@@ -207,7 +208,10 @@ class CityRunner:
         self.ledger.expire_stale_positions(ttl_hours=28)
 
         trailing_bias = self.ledger.fetch_trailing_bias(self.icao)
-        engine        = ExecutionEngine(self.client, self.ledger, self.vault_usd, self.icao)
+        engine        = ExecutionEngine(
+            self.client, self.ledger, self.vault_usd, self.icao,
+            paper_trading=self.config.paper_trading,
+        )
 
         for label, signal in actionable.items():
             direction = signal.direction  # "BUY" or "SELL"
@@ -309,6 +313,7 @@ class CityRunner:
             edge_threshold = self.edge_threshold,
             trail_pct      = self.trail_pct,
             icao           = self.icao,
+            paper_trading  = self.config.paper_trading,
         )
         market_date = self._state.get("market_date", self._local_now().strftime("%Y-%m-%d"))
         results = monitor.run(model_probs, market_date=market_date)

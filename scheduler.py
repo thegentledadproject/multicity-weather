@@ -102,6 +102,23 @@ TRAIL_PCT      = float(os.getenv("TRAIL_PCT", 0.20))
 # Set VALIDATION_MODE=false in .env once validation run is complete.
 VALIDATION_MODE = os.getenv("VALIDATION_MODE", "false").lower() == "true"
 
+
+def _resolve_validation_mode(icao: str) -> bool:
+    """
+    Per-city override: VALIDATION_MODE_<ICAO> (e.g. VALIDATION_MODE_WMKK=true),
+    falling back to the global VALIDATION_MODE if unset — same pattern as
+    config.cities.resolve_vault_usd's VAULT_USD_<ICAO> override.
+
+    Needed because a city graduating from paper_trading (config.cities) to
+    validation mode shouldn't force every OTHER already-live city (e.g. WSSS)
+    down to $1 trades too — the old single global VALIDATION_MODE var couldn't
+    express "validate WMKK only while WSSS keeps running normally."
+    """
+    override = os.getenv(f"VALIDATION_MODE_{icao.upper()}")
+    if override is not None:
+        return override.lower() == "true"
+    return VALIDATION_MODE
+
 # ── Shared singletons ──────────────────────────────────────────────────────────
 _ledger  = Ledger(DB_PATH)
 _client  = None   # initialised in main() to catch auth errors early
@@ -113,16 +130,23 @@ def _build_runners() -> dict:
     (see config.cities.resolve_vault_usd — dynamic per-city env override)."""
     runners = {}
     for icao, config in CITIES.items():
-        vault_usd = resolve_vault_usd(config)
+        vault_usd       = resolve_vault_usd(config)
+        validation_mode = _resolve_validation_mode(icao)
         runners[icao] = CityRunner(
             config          = config,
             ledger          = _ledger,
             vault_usd       = vault_usd,
             edge_threshold  = EDGE_THRESHOLD,
             trail_pct       = TRAIL_PCT,
-            validation_mode = VALIDATION_MODE,
+            validation_mode = validation_mode,
         )
-        logger.info(f"[INIT] City configured: {icao} ({config.display_name}) — vault=${vault_usd:.2f}")
+        if config.paper_trading:
+            mode = " [PAPER TRADING]"
+        elif validation_mode:
+            mode = " [VALIDATION MODE — $1 real trades]"
+        else:
+            mode = ""
+        logger.info(f"[INIT] City configured: {icao} ({config.display_name}) — vault=${vault_usd:.2f}{mode}")
     return runners
 
 
@@ -141,9 +165,16 @@ def main():
         f"  Cities: {', '.join(f'{icao}=${r.vault_usd:.0f}' for icao, r in _runners.items())} "
         f"(total ${total_vault:.0f}) | Edge threshold: {EDGE_THRESHOLD*100:.0f}%"
     )
-    if VALIDATION_MODE:
-        logger.warning("  ⚠️  VALIDATION_MODE ACTIVE — all trades forced to $1, EV gating bypassed")
-        logger.warning("  ⚠️  Set VALIDATION_MODE=false in .env to resume normal Kelly sizing")
+    validation_cities = [icao for icao, r in _runners.items() if r.validation_mode]
+    if validation_cities:
+        logger.warning(
+            f"  ⚠️  VALIDATION MODE ACTIVE for {', '.join(validation_cities)} — "
+            f"trades forced to $1, EV gating bypassed for {'that city' if len(validation_cities) == 1 else 'these cities'} only"
+        )
+        logger.warning(
+            "  ⚠️  Unset VALIDATION_MODE_<ICAO> (or the global VALIDATION_MODE) in .env "
+            "to resume normal Kelly sizing"
+        )
     logger.info("═" * 60)
 
     # Warn if vault/cap/floor collapse the sizing range (see sizing.py) —

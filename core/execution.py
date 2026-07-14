@@ -270,11 +270,18 @@ def _parse_fill_status(response: Any, label: str) -> bool:
 
 
 class ExecutionEngine:
-    def __init__(self, client: ClobClient, ledger: Ledger, vault_usd: float, icao: str = "WSSS"):
-        self.client    = client
-        self.ledger    = ledger
-        self.vault_usd = vault_usd
-        self.icao      = icao
+    def __init__(
+        self, client: ClobClient, ledger: Ledger, vault_usd: float, icao: str = "WSSS",
+        paper_trading: bool = False,
+    ):
+        self.client        = client
+        self.ledger        = ledger
+        self.vault_usd     = vault_usd
+        self.icao          = icao
+        # See config.cities.CityConfig.paper_trading — real order book is
+        # still fetched/validated above for a realistic fill price, but no
+        # CLOB order is ever created or posted when this is True.
+        self.paper_trading = paper_trading
 
     def execute(
         self,
@@ -366,9 +373,26 @@ class ExecutionEngine:
             return False
 
         logger.info(
-            f"[EXEC] 🔥 {direction} {label} | VWAP={vwap_exec:.4f} | "
+            f"[EXEC] {'📝 PAPER ' if self.paper_trading else '🔥 '}{direction} {label} | VWAP={vwap_exec:.4f} | "
             f"${sizing.size_usd:.2f} | net EV={sizing.net_ev*100:+.2f}%"
         )
+
+        # ── Paper trading: simulate the fill at the validated VWAP, skip
+        # real order placement entirely. Book fetch + revalidation + drift
+        # check above already happened against LIVE prices, so this is a
+        # realistic fill, not a fabricated one — only the order write is skipped.
+        if self.paper_trading:
+            position_label = f"{label}:{'YES' if direction == 'BUY' else 'NO'}"
+            self.ledger.record_position(
+                token_id    = token_id,
+                label       = position_label,
+                icao        = self.icao,
+                entry_price = vwap_exec,
+                size_usd    = sizing.size_usd,
+                market_date = market_date,
+                is_paper    = True,
+            )
+            return True
 
         # ── Order amount semantics (confirmed from Polymarket CLOB docs) ──────
         # Market BUY:  amount = quote notional in USD (dollars to spend)

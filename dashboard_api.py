@@ -111,6 +111,16 @@ def _vault_start(icao: str) -> float:
     config = CITIES.get(icao.upper())
     return resolve_vault_usd(config) if config else 0.0
 
+def _is_paper(icao: str) -> int:
+    """
+    1 if this city trades in paper mode (config.cities.CityConfig.paper_trading),
+    else 0. Every exit_log/open_positions query for money figures (P&L, vault,
+    ROI) filters on this so a paper city's simulated results never mix with a
+    real city's real ones — see core/execution.py's is_paper writes.
+    """
+    config = CITIES.get(icao.upper())
+    return 1 if (config and config.paper_trading) else 0
+
 # ── API routes ────────────────────────────────────────────────────────────────
 
 @app.get("/api/status")
@@ -133,9 +143,10 @@ def cities():
     return {
         "cities": [
             {
-                "icao":         c.icao,
-                "display_name": c.display_name,
-                "vault_start":  _vault_start(c.icao),
+                "icao":          c.icao,
+                "display_name":  c.display_name,
+                "vault_start":   _vault_start(c.icao),
+                "paper_trading": c.paper_trading,
             }
             for c in CITIES.values()
         ]
@@ -191,11 +202,18 @@ def upstream_status(icao: str = DEFAULT_ICAO):
 def kpis(icao: str = DEFAULT_ICAO):
     """Headline KPI numbers for one city."""
     icao        = icao.upper()
+    is_paper    = _is_paper(icao)
     vault_start = _vault_start(icao)
-    net_pnl      = _scalar("SELECT COALESCE(SUM(realised_pnl),0) FROM exit_log WHERE icao_code = ?", (icao,))
-    total_trades = _scalar("SELECT COUNT(*) FROM exit_log WHERE icao_code = ?", (icao,), default=0)
+    net_pnl      = _scalar(
+        "SELECT COALESCE(SUM(realised_pnl),0) FROM exit_log WHERE icao_code = ? AND is_paper = ?",
+        (icao, is_paper),
+    )
+    total_trades = _scalar(
+        "SELECT COUNT(*) FROM exit_log WHERE icao_code = ? AND is_paper = ?", (icao, is_paper), default=0,
+    )
     wins         = _scalar(
-        "SELECT COUNT(*) FROM exit_log WHERE icao_code = ? AND realised_pnl > 0", (icao,), default=0,
+        "SELECT COUNT(*) FROM exit_log WHERE icao_code = ? AND is_paper = ? AND realised_pnl > 0",
+        (icao, is_paper), default=0,
     )
     trail_bias   = _scalar("""
         SELECT AVG(residual) FROM (
@@ -204,7 +222,9 @@ def kpis(icao: str = DEFAULT_ICAO):
     """, (icao,), default=0.0)
     mae          = _scalar("SELECT AVG(ABS(residual)) FROM calibration_logs WHERE icao_code = ?", (icao,), default=0.0)
     n_calib      = _scalar("SELECT COUNT(*) FROM calibration_logs WHERE icao_code = ?", (icao,), default=0)
-    n_open       = _scalar("SELECT COUNT(*) FROM open_positions WHERE icao_code = ?", (icao,), default=0)
+    n_open       = _scalar(
+        "SELECT COUNT(*) FROM open_positions WHERE icao_code = ? AND is_paper = ?", (icao, is_paper), default=0,
+    )
     actionable   = _scalar(
         "SELECT COUNT(*) FROM signal_log WHERE icao_code = ? AND action IN ('SIGNAL_BUY','SIGNAL_SELL_NO')",
         (icao,), default=0,
@@ -218,6 +238,7 @@ def kpis(icao: str = DEFAULT_ICAO):
     roi          = (net_pnl / vault_start * 100) if vault_start else 0.0
     return {
         "icao":           icao,
+        "paper_trading":  bool(is_paper),
         "vault_current":  round(vault_start + net_pnl, 2),
         "vault_start":    vault_start,
         "net_pnl":        round(net_pnl, 4),
@@ -240,17 +261,33 @@ def overview():
     Aggregated view across every configured city — the "center dashboard".
     One row per city (allocation, current vault, ROI, win rate, open
     positions) plus combined totals.
+
+    Combined totals only sum REAL (non-paper) cities — a paper city's
+    simulated P&L must never inflate/deflate the real "Combined Vault" figure.
+    Paper cities still get their own row (with paper_trading=true) so their
+    simulated results are visible, just not blended into the real total.
     """
     rows = []
     combined_start = 0.0
     combined_pnl   = 0.0
     for config in CITIES.values():
-        icao   = config.icao
+        icao     = config.icao
+        is_paper = _is_paper(icao)
         vstart = _vault_start(icao)
-        pnl    = _scalar("SELECT COALESCE(SUM(realised_pnl),0) FROM exit_log WHERE icao_code = ?", (icao,))
-        total_trades = _scalar("SELECT COUNT(*) FROM exit_log WHERE icao_code = ?", (icao,), default=0)
-        wins   = _scalar("SELECT COUNT(*) FROM exit_log WHERE icao_code = ? AND realised_pnl > 0", (icao,), default=0)
-        n_open = _scalar("SELECT COUNT(*) FROM open_positions WHERE icao_code = ?", (icao,), default=0)
+        pnl    = _scalar(
+            "SELECT COALESCE(SUM(realised_pnl),0) FROM exit_log WHERE icao_code = ? AND is_paper = ?",
+            (icao, is_paper),
+        )
+        total_trades = _scalar(
+            "SELECT COUNT(*) FROM exit_log WHERE icao_code = ? AND is_paper = ?", (icao, is_paper), default=0,
+        )
+        wins   = _scalar(
+            "SELECT COUNT(*) FROM exit_log WHERE icao_code = ? AND is_paper = ? AND realised_pnl > 0",
+            (icao, is_paper), default=0,
+        )
+        n_open = _scalar(
+            "SELECT COUNT(*) FROM open_positions WHERE icao_code = ? AND is_paper = ?", (icao, is_paper), default=0,
+        )
         avg_edge = _scalar(
             "SELECT AVG(ABS(edge)) FROM signal_log WHERE icao_code = ? AND action IN ('SIGNAL_BUY','SIGNAL_SELL_NO')",
             (icao,), default=0.0,
@@ -261,6 +298,7 @@ def overview():
         rows.append({
             "icao":           icao,
             "display_name":   config.display_name,
+            "paper_trading":  bool(is_paper),
             "vault_start":    round(vstart, 2),
             "vault_current":  round(vstart + pnl, 2),
             "net_pnl":        round(pnl, 4),
@@ -270,8 +308,9 @@ def overview():
             "open_positions": int(n_open),
             "avg_edge_pct":   round(avg_edge * 100, 2),
         })
-        combined_start += vstart
-        combined_pnl   += pnl
+        if not is_paper:
+            combined_start += vstart
+            combined_pnl   += pnl
 
     combined_roi = (combined_pnl / combined_start * 100) if combined_start else 0.0
     return {
@@ -292,8 +331,8 @@ def equity(icao: str = DEFAULT_ICAO):
     rows = _rows(
         "SELECT id, bracket_label, direction, reason, "
         "entry_price, exit_price, size_usd, realised_pnl, closed_at "
-        "FROM exit_log WHERE icao_code = ? ORDER BY id ASC",
-        (icao,),
+        "FROM exit_log WHERE icao_code = ? AND is_paper = ? ORDER BY id ASC",
+        (icao, _is_paper(icao)),
     )
     running = vault_start
     for r in rows:
@@ -412,32 +451,35 @@ def calibration(icao: str = DEFAULT_ICAO):
 @app.get("/api/pnl_by_bracket")
 def pnl_by_bracket(icao: str = DEFAULT_ICAO):
     """P&L grouped by bracket + direction, for one city."""
+    icao = icao.upper()
     rows = _rows(
         "SELECT bracket_label, direction, "
         "SUM(realised_pnl) AS total_pnl, COUNT(*) AS n_trades, "
         "SUM(CASE WHEN realised_pnl > 0 THEN 1 ELSE 0 END) AS wins "
-        "FROM exit_log WHERE icao_code = ? GROUP BY bracket_label, direction ORDER BY bracket_label",
-        (icao.upper(),),
+        "FROM exit_log WHERE icao_code = ? AND is_paper = ? GROUP BY bracket_label, direction ORDER BY bracket_label",
+        (icao, _is_paper(icao)),
     )
     return {"groups": rows}
 
 @app.get("/api/exit_reasons")
 def exit_reasons(icao: str = DEFAULT_ICAO):
     """Exit reason counts for one city."""
+    icao = icao.upper()
     rows = _rows(
         "SELECT reason, COUNT(*) AS count, "
         "SUM(realised_pnl) AS total_pnl "
-        "FROM exit_log WHERE icao_code = ? GROUP BY reason ORDER BY count DESC",
-        (icao.upper(),),
+        "FROM exit_log WHERE icao_code = ? AND is_paper = ? GROUP BY reason ORDER BY count DESC",
+        (icao, _is_paper(icao)),
     )
     return {"reasons": rows}
 
 @app.get("/api/open_positions")
 def open_positions(icao: str = DEFAULT_ICAO):
     """All currently open positions for one city, with live trail/stop levels."""
+    icao = icao.upper()
     rows = _rows(
-        "SELECT * FROM open_positions WHERE icao_code = ? ORDER BY opened_at ASC",
-        (icao.upper(),),
+        "SELECT * FROM open_positions WHERE icao_code = ? AND is_paper = ? ORDER BY opened_at ASC",
+        (icao, _is_paper(icao)),
     )
     trail_pct   = float(os.getenv("TRAIL_PCT", 0.20))
     edge_thresh = float(os.getenv("EDGE_THRESHOLD", 0.05))
@@ -470,10 +512,11 @@ def open_positions(icao: str = DEFAULT_ICAO):
 @app.get("/api/trades")
 def trades(limit: int = 100, icao: str = DEFAULT_ICAO):
     """Recent trade history for one city."""
+    icao = icao.upper()
     rows = _rows(
         "SELECT id, closed_at, bracket_label, direction, reason, "
         "entry_price, exit_price, size_usd, realised_pnl, opened_at "
-        "FROM exit_log WHERE icao_code = ? ORDER BY id DESC LIMIT ?",
-        (icao.upper(), limit),
+        "FROM exit_log WHERE icao_code = ? AND is_paper = ? ORDER BY id DESC LIMIT ?",
+        (icao, _is_paper(icao), limit),
     )
     return {"trades": rows}
