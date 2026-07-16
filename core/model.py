@@ -8,7 +8,7 @@ FORECAST PIPELINE:
   Source 1 — GFS 31-member ensemble (Open-Meteo ensemble API)
     Provides mu_gfs and sigma_gfs from member spread.
 
-  Source 2 — ECMWF 51-member ensemble (Open-Meteo ensemble API)
+  Source 2 — ECMWF 50-member ensemble (Open-Meteo ensemble API, ecmwf_ifs025)
     Provides mu_ecmwf and sigma_ecmwf from member spread.
     ECMWF is the globally superior model (lower RMSE on tropical stations).
     Weighted more heavily in the blend: 60% ECMWF / 40% GFS.
@@ -41,7 +41,7 @@ from typing import Dict, Optional, Tuple
 logger = logging.getLogger("hermes.model")
 
 # ── Open-Meteo ensemble API ─────────────────────────────────────────────────
-# GFS: 31 members | ECMWF: 51 members
+# GFS: 31 members | ECMWF: 50 members
 # Both available free, no API key required. Timezone left as Singapore for
 # the shared template's default — callers that need a different tz can
 # still get correct UTC-anchored peak-hour data since hourly timestamps are
@@ -56,7 +56,19 @@ _ENSEMBLE_BASE = (
     "&forecast_days=1"
 )
 GFS_ENSEMBLE_URL    = _ENSEMBLE_BASE.replace("{model}", "gfs_seamless")
-ECMWF_ENSEMBLE_URL  = _ENSEMBLE_BASE.replace("{model}", "ecmwf_ifs04")
+# ecmwf_ifs04 is a deprecated Open-Meteo model identifier (found 2026-07-17):
+# it still returns HTTP 200, but the response silently reverted to the
+# deterministic single-value shape (hourly = {"time", "temperature_2m"} only,
+# temperature_2m all null) -- zero temperature_2m_member* keys, so
+# _fetch_ensemble_members() always saw 0 members and returned None on EVERY
+# cycle, not intermittently. That means the bot has been running GFS-only
+# since whenever Open-Meteo made this change, silently missing the ECMWF
+# half of the blend (and the inter-model divergence sigma-widening term)
+# the whole time -- the old health check only checked for HTTP 200, which
+# this response satisfies, so it never surfaced. ecmwf_ifs025 is the
+# current correct identifier -- verified live: 50 valid members with real
+# data, reproducing a genuine ensemble_blend forecast again.
+ECMWF_ENSEMBLE_URL  = _ENSEMBLE_BASE.replace("{model}", "ecmwf_ifs025")
 
 # ── Open-Meteo standard forecast (fallback if ensemble unavailable) ──────────
 OPEN_METEO_FORECAST_URL = (
