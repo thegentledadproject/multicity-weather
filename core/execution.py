@@ -22,6 +22,7 @@ They are called from APScheduler jobs running in a thread pool.
 
 import logging
 import os
+import datetime
 from typing import Any, Dict, Optional
 
 from py_clob_client_v2.client import ClobClient
@@ -36,6 +37,15 @@ from core.sizing import SizingResult
 logger = logging.getLogger("hermes.execution")
 
 VWAP_DRIFT_TOLERANCE = 0.03   # Abort if book moves > 3% between compute and exec
+
+# Re-entry cooldown: after a bracket exits via STOP_LOSS or TRAILING_STOP
+# (an adverse-move signal, unlike the scheduled TIME_EXIT), block reopening
+# that SAME bracket for this many minutes. Added 2026-07-16 after a live
+# trade log showed the same bracket stop-lossing and immediately reopening
+# within single 15-min cycles, repeatedly, compounding losses -- there was
+# previously no cooldown of any kind between exit and re-entry.
+REENTRY_COOLDOWN_MINUTES = float(os.getenv("REENTRY_COOLDOWN_MINUTES", "60"))
+_COOLDOWN_EXIT_REASONS   = {"STOP_LOSS", "TRAILING_STOP"}
 
 
 def build_client() -> ClobClient:
@@ -320,6 +330,21 @@ class ExecutionEngine:
         if self.ledger.is_position_open(token_id):
             logger.info(f"[EXEC] {label}: position already open — skip")
             return False
+
+        # ── Re-entry cooldown ────────────────────────────────────────────────
+        last_exit = self.ledger.get_last_exit(self.icao, label)
+        if last_exit and last_exit["reason"] in _COOLDOWN_EXIT_REASONS:
+            try:
+                closed_at = datetime.datetime.fromisoformat(last_exit["closed_at"])
+                elapsed_min = (datetime.datetime.utcnow() - closed_at).total_seconds() / 60.0
+            except (ValueError, TypeError):
+                elapsed_min = REENTRY_COOLDOWN_MINUTES  # unparseable timestamp — fail open, don't block forever
+            if elapsed_min < REENTRY_COOLDOWN_MINUTES:
+                logger.info(
+                    f"[EXEC] {label}: cooldown active ({elapsed_min:.0f}/{REENTRY_COOLDOWN_MINUTES:.0f}m "
+                    f"since {last_exit['reason']}) — skip"
+                )
+                return False
 
         if sizing.verdict != "EXECUTE":
             logger.info(f"[EXEC] {label}: sizing says HOLD — skip")

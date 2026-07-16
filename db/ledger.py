@@ -495,6 +495,25 @@ class Ledger:
                 "SELECT * FROM exit_log ORDER BY id DESC LIMIT 100"
             ).fetchall()
 
+    def get_last_exit(self, icao: str, bracket_label: str) -> Optional[sqlite3.Row]:
+        """
+        Most recent exit_log row for this icao + plain bracket label (e.g.
+        "30°C", not "30°C:YES" — position_monitor.py's _parse_bracket()
+        already strips the direction suffix before calling log_exit()).
+
+        Used by execution.py's re-entry cooldown: after a STOP_LOSS or
+        TRAILING_STOP exit, don't immediately reopen the SAME bracket —
+        that's exactly the shape a whipsaw/stale-price-driven loss cluster
+        takes (confirmed live: a pasted trade log showed the same bracket
+        stop-lossing and reopening repeatedly within single 15-min cycles).
+        """
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT * FROM exit_log WHERE icao_code = ? AND bracket_label = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (icao.upper(), bracket_label),
+            ).fetchone()
+
     def daily_pnl(self, date: str, icao: Optional[str] = None) -> float:
         """Sum of realised_pnl for all exits on a given SGT market date."""
         with self._conn() as conn:

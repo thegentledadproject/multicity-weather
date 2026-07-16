@@ -47,7 +47,19 @@ logger = logging.getLogger("hermes.sizing")
 TAKER_FEE_RATE    = 0.02    # Polymarket maker/taker fee
 GAS_COST_USD      = 0.05    # Polygon gas estimate
 MIN_POSITION_USD  = 10.0    # Hard floor
-MAX_POSITION_PCT  = 0.05    # Cap at 5% of vault per trade
+
+# Cap as % of vault per trade. Raised from 5% (2026-07-16): at 5%, the cap
+# only clears the $10 floor once vault >= $200 -- WSSS's $200 vault sat
+# EXACTLY on that boundary (cap == floor == $10, so every single trade was
+# forced to identical size regardless of edge magnitude -- confirmed live:
+# a pasted trade log showed every fill at exactly $10.00), and WMKK's $100
+# vault sat BELOW it (cap=$5 < floor=$10, so compute_size() could NEVER
+# return EXECUTE -- WMKK's only live trades were forced through
+# compute_validation_size(), which bypasses this cap/floor entirely). 15%
+# gives real Kelly-driven range for both current vault sizes: WSSS
+# $10-$30, WMKK $10-$15. Runtime-configurable in case future vault sizes
+# need a different value.
+MAX_POSITION_PCT  = float(os.getenv("MAX_POSITION_PCT", "0.15"))
 
 # Runtime-configurable via .env — defaults match v4.5 option 2 & 3 fix
 KELLY_FRACTION    = float(os.getenv("KELLY_FRACTION",  "0.50"))  # half Kelly

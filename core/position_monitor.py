@@ -54,6 +54,7 @@ from py_clob_client_v2.order_builder.constants import BUY as _CLOB_BUY, SELL as 
 
 from db.ledger import Ledger
 from core.edge import fetch_market_price, MarketPrice
+from core.execution import _is_ghost_book
 
 logger = logging.getLogger("hermes.monitor")
 
@@ -530,6 +531,21 @@ class PositionMonitor:
         except Exception as e:
             logger.error(f"[MONITOR] {label}: book fetch failed: {e}")
             return self._result(decision, size_usd, opened_at, None, False, "book_fetch_failed")
+
+        # ── Ghost-book guard (same as core/execution.py's entry-side check) ────
+        # Polymarket py-clob-client issue #180: get_order_book() intermittently
+        # returns a stale bid=0.01/ask=0.99 snapshot for an active, liquid
+        # market. execution.py already guards entries against this; exits had
+        # NO such guard, so a stop-loss/trailing-stop could compute its fill
+        # price from a garbage stale book and record a spurious near-total
+        # loss that was never a real market price. Retry next cycle instead —
+        # the position stays open and gets re-evaluated with a fresh book.
+        if _is_ghost_book(book):
+            logger.error(
+                f"[MONITOR] {label}: ghost book detected at exit (get_order_book "
+                f"issue #180) — refusing to exit on a stale snapshot, will retry next cycle"
+            )
+            return self._result(decision, size_usd, opened_at, None, False, "ghost_book")
 
         # ── Exact share count to close — NOT size_usd (the original dollar
         # notional). Confirmed bug: walking the book to a size_usd proceeds/
