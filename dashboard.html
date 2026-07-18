@@ -140,15 +140,15 @@
   .row-pass td  { background: rgba(34,197,94,.04); }
 
   @media (max-width: 900px) {
-    .kpi-row { grid-template-columns: repeat(3,1fr); }
+    .kpi-row, .combined-row { grid-template-columns: repeat(3,1fr); }
     .grid-2-1,.grid-3-2,.grid-2-1b { grid-template-columns: 1fr; }
   }
   @media (max-width: 560px) {
-    .kpi-row { grid-template-columns: repeat(2,1fr); }
+    .kpi-row, .combined-row { grid-template-columns: repeat(2,1fr); }
   }
 
   /* ── Overview (center dashboard) ── */
-  .combined-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px;
+  .combined-row { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px;
                   margin-bottom: 20px; }
   .city-grid    { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
                   gap: 14px; }
@@ -207,6 +207,16 @@
         <div class="kpi-value amber" id="ov-open">—</div>
         <div class="kpi-sub">across all cities</div>
       </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Wallet Balance</div>
+        <div class="kpi-value teal" id="ov-balance">—</div>
+        <div class="kpi-sub" id="ov-balance-sub">wallet, live</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Portfolio</div>
+        <div class="kpi-value amber" id="ov-portfolio">—</div>
+        <div class="kpi-sub" id="ov-portfolio-sub">—</div>
+      </div>
     </div>
     <div class="section-title">Cities</div>
     <div class="city-grid" id="city-grid">
@@ -227,6 +237,14 @@
     <span class="status-dot" id="upstream-dot"></span>
     <span id="upstream-text">ECMWF: checking…</span>
     <span class="status-latency" id="upstream-latency"></span>
+    <span class="status-sep">·</span>
+    <span class="status-dot" id="gfs-dot"></span>
+    <span id="gfs-text">GFS: checking…</span>
+    <span class="status-latency" id="gfs-latency"></span>
+    <span class="status-sep">·</span>
+    <span class="status-dot" id="wallet-dot"></span>
+    <span id="wallet-text">Wallet: checking…</span>
+    <span class="status-latency" id="wallet-synced"></span>
     <span style="margin-left:auto" id="last-updated"></span>
   </div>
 
@@ -461,10 +479,11 @@ function showCity(icao) {
   document.getElementById("detail-view").style.display = "";
   refresh();
   pollUpstreamStatus();
+  pollGfsStatus();
 }
 
 function refreshCurrent() {
-  if (currentIcao) { refresh(); pollUpstreamStatus(); }
+  if (currentIcao) { refresh(); pollUpstreamStatus(); pollGfsStatus(); }
   else { refreshOverview(); }
 }
 
@@ -650,27 +669,34 @@ function renderPositions(d) {
     return;
   }
   el.innerHTML = d.positions.map(p => {
-    const label    = p.bracket_label;
-    const bracket  = label.split(":")[0];
-    const dir      = p.direction;
-    const entry    = +p.entry_price;
-    const peak     = +(p.peak_price || entry);
-    const size     = +p.size_usd;
-    const armed    = p.trail_armed;
-    const trail    = p.trail_level;
-    const stop     = p.stop_level;
-    const hours    = p.hold_hours;
+    const label     = p.bracket_label;
+    const bracket   = label.split(":")[0];
+    const dir       = p.direction;
+    const entry     = +p.entry_price;
+    const peak      = +(p.peak_price || entry);
+    const size      = +p.size_usd;
+    const armed     = p.trail_armed;
+    const trail     = p.trail_level;
+    const stop      = p.stop_level;
+    const hours     = p.hold_hours;
+    const value     = p.current_value != null ? +p.current_value : size;
+    const pnlPct    = p.unrealized_pnl_pct;
+    const pnlUsd    = p.unrealized_pnl_usd != null ? +p.unrealized_pnl_usd : 0;
+    const pnlCls    = pnlUsd >= 0 ? "positive" : "negative";
+    const profitPct = p.profit_taking_pct;
+    const stopPct   = p.stop_loss_pct;
     const trailStr = armed && trail
       ? `Trail: ${trail.toFixed(4)}` : "Trail: arming…";
     return `
 <div class="pos-card">
   <div class="pos-top">
     <span class="pos-label">${bracket} · ${dir}</span>
-    <span class="pos-size">$${size.toFixed(2)}</span>
+    <span class="pos-size">$${value.toFixed(2)}</span>
   </div>
   <div class="pos-row">Entry ${entry.toFixed(4)} · Peak ${peak.toFixed(4)} · ${hours}h open</div>
-  <div class="pos-row pos-trail">${trailStr}</div>
-  <div class="pos-row pos-stop">Stop: ${stop ? stop.toFixed(4) : "—"}</div>
+  <div class="pos-row ${pnlCls}">Value $${value.toFixed(2)} (${pnlUsd >= 0 ? "+" : ""}$${pnlUsd.toFixed(4)}${pnlPct != null ? `, ${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(1)}%` : ""})</div>
+  <div class="pos-row pos-trail">${trailStr}${profitPct != null ? ` (take-profit ${profitPct.toFixed(0)}%)` : ""}</div>
+  <div class="pos-row pos-stop">Stop: ${stop ? stop.toFixed(4) : "—"}${stopPct != null ? ` (-${stopPct.toFixed(1)}%)` : ""}</div>
 </div>`;
   }).join("");
 }
@@ -825,13 +851,113 @@ async function pollUpstreamStatus() {
   if (!currentIcao) return;   // no upstream dot on the overview page
   try {
     const u = await api(icaoParam("/api/upstream_status"));
+    const cachedSuffix = u.cached ? " (cached)" : "";
     if (u.ok) {
-      setUpstreamUI("live", "ECMWF: reachable" + (u.cached ? " (cached)" : ""), u.latency_ms);
+      setUpstreamUI("live", "ECMWF: reachable, " + u.n_members + " members" + cachedSuffix, u.latency_ms);
+    } else if (u.status_code === 200) {
+      // Reachable but degraded — HTTP 200 with too few ensemble members to
+      // trust (core/model.py requires >=3). Distinct from a network-level
+      // failure: the bot is silently running GFS-only, not erroring out.
+      setUpstreamUI("mock", "ECMWF: degraded — only " + (u.n_members ?? 0) + " members, bot falling back to GFS-only" + cachedSuffix, u.latency_ms);
     } else {
-      setUpstreamUI("down", "ECMWF: unreachable — bot will fall back to GFS-only", u.latency_ms);
+      setUpstreamUI("down", "ECMWF: unreachable — bot will fall back to GFS-only" + cachedSuffix, u.latency_ms);
     }
   } catch (err) {
     setUpstreamUI("down", "ECMWF: status check failed", null);
+  }
+}
+
+// ── Upstream GFS/Open-Meteo status poller ────────────────────────────────────
+// Same shape as the ECMWF poller above, hitting the GFS-specific backend
+// endpoint — GFS and ECMWF are independent upstreams (40%/60% blend weight),
+// so either can degrade without the other.
+function setGfsUI(state, text, latencyMs) {
+  const dot = document.getElementById("gfs-dot");
+  const txt = document.getElementById("gfs-text");
+  const lat = document.getElementById("gfs-latency");
+  dot.className = "status-dot " + state;
+  txt.textContent = text;
+  lat.textContent = latencyMs != null ? latencyMs + "ms" : "";
+}
+
+async function pollGfsStatus() {
+  if (!currentIcao) return;   // no GFS dot on the overview page
+  try {
+    const g = await api(icaoParam("/api/gfs_status"));
+    const cachedSuffix = g.cached ? " (cached)" : "";
+    if (g.ok) {
+      setGfsUI("live", "GFS: reachable, " + g.n_members + " members" + cachedSuffix, g.latency_ms);
+    } else if (g.status_code === 200) {
+      setGfsUI("mock", "GFS: degraded — only " + (g.n_members ?? 0) + " members, bot falling back to ECMWF-only" + cachedSuffix, g.latency_ms);
+    } else {
+      setGfsUI("down", "GFS: unreachable — bot will fall back to ECMWF-only" + cachedSuffix, g.latency_ms);
+    }
+  } catch (err) {
+    setGfsUI("down", "GFS: status check failed", null);
+  }
+}
+
+// ── Wallet balance poller ─────────────────────────────────────────────────────
+// Live deposit-wallet COLLATERAL balance from the CLOB's own balance-allowance
+// cache — the same one core/execution.py re-syncs immediately before every
+// order. One wallet is shared across every city, so this is global, not
+// icao-scoped. Showing "synced Xs ago" (not just the dollar figure) makes a
+// stale cache visible on the dashboard instead of only surfacing as a
+// "balance: 0" order rejection buried in journalctl.
+let lastWalletSyncedAt = null;
+
+function setWalletUI(state, text, syncedLabel) {
+  const dot = document.getElementById("wallet-dot");
+  const txt = document.getElementById("wallet-text");
+  const syn = document.getElementById("wallet-synced");
+  dot.className = "status-dot " + state;
+  txt.textContent = text;
+  syn.textContent = syncedLabel || "";
+}
+
+function _agoLabel(isoTs) {
+  if (!isoTs) return "";
+  const secs = Math.max(0, Math.round((Date.now() - new Date(isoTs + "Z").getTime()) / 1000));
+  if (secs < 60) return "synced " + secs + "s ago";
+  if (secs < 3600) return "synced " + Math.round(secs / 60) + "m ago";
+  return "synced " + Math.round(secs / 3600) + "h ago";
+}
+
+async function pollWalletBalance() {
+  try {
+    const w = await api("/api/wallet_balance");
+    if (w.synced_at) lastWalletSyncedAt = w.synced_at;
+    const balText = w.balance_usd != null ? "Wallet: $" + w.balance_usd.toFixed(2) : "Wallet: unknown";
+    if (w.ok) {
+      setWalletUI("live", balText, _agoLabel(lastWalletSyncedAt));
+    } else {
+      setWalletUI("down", balText + " (sync failed)", _agoLabel(lastWalletSyncedAt));
+    }
+  } catch (err) {
+    setWalletUI("down", "Wallet: status check failed", _agoLabel(lastWalletSyncedAt));
+  }
+}
+
+// ── Portfolio poller (Overview's Wallet Balance + Portfolio KPI cards) ──────
+// Balance is the idle on-chain wallet figure (same number the status-bar
+// wallet indicator shows); Portfolio adds the live market value of every
+// open REAL (non-paper) position on top — the bot's real net worth right
+// now, not just cash sitting idle between trades. Global like the wallet
+// itself, so this only updates the Overview cards, not per-city ones.
+async function pollPortfolio() {
+  try {
+    const p = await api("/api/portfolio");
+    const balEl  = document.getElementById("ov-balance");
+    const balSub = document.getElementById("ov-balance-sub");
+    const porEl  = document.getElementById("ov-portfolio");
+    const porSub = document.getElementById("ov-portfolio-sub");
+    if (!balEl) return;   // overview markup not present (shouldn't happen)
+    balEl.textContent = p.balance_usd != null ? "$" + p.balance_usd.toFixed(2) : "—";
+    balSub.textContent = p.ok ? "wallet, live" : "wallet, sync failed";
+    porEl.textContent = "$" + p.portfolio_usd.toFixed(2);
+    porSub.textContent = "+$" + p.positions_value_usd.toFixed(2) + " in " + p.n_positions + " open position" + (p.n_positions === 1 ? "" : "s") + " (real only)";
+  } catch (err) {
+    // leave last-known values in place on a transient failure
   }
 }
 
@@ -873,10 +999,13 @@ async function refresh() {
   }
 }
 
-// Boot: backend status polls every 3s, upstream ECMWF status every 10s
-// (backend caches upstream checks for 30s regardless), full data refresh every 30s.
-// Starts on the overview (center dashboard); city registry loads once so
-// showCity() can resolve display names for the header/footer.
+// Boot: backend status polls every 3s, upstream ECMWF/GFS status every 10s
+// (backend caches upstream checks for 30s regardless), wallet balance +
+// portfolio every 60s (these hit the real CLOB API — a shared wallet across
+// every city, so global rather than per-icao — poll less aggressively than
+// the backend's own 20s cache TTL strictly requires), full data refresh
+// every 30s. Starts on the overview (center dashboard); city registry loads
+// once so showCity() can resolve display names for the header/footer.
 async function boot() {
   try {
     const c = await api("/api/cities");
@@ -886,9 +1015,14 @@ async function boot() {
 }
 
 pollApiStatus();
+pollWalletBalance();
+pollPortfolio();
 boot();
 setInterval(pollApiStatus, 3000);
 setInterval(pollUpstreamStatus, 10000);
+setInterval(pollGfsStatus, 10000);
+setInterval(pollWalletBalance, 60000);
+setInterval(pollPortfolio, 60000);
 setInterval(refreshCurrent, 30000);
 </script>
 </body>
