@@ -126,6 +126,7 @@ class CityRunner:
 
         forecast = fetch_gfs_forecast(
             lat=self.config.lat, lon=self.config.lon,
+            timezone=self.config.timezone,
             hard_prior_mu=self.config.hard_prior_mu,
             hard_prior_sigma=self.config.hard_prior_sigma,
         )
@@ -314,6 +315,7 @@ class CityRunner:
             trail_pct      = self.trail_pct,
             icao           = self.icao,
             paper_trading  = self.config.paper_trading,
+            timezone       = self.config.timezone,
         )
         market_date = self._state.get("market_date", self._local_now().strftime("%Y-%m-%d"))
         results = monitor.run(model_probs, market_date=market_date)

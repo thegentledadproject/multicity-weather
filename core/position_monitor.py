@@ -33,7 +33,8 @@ EXIT CONDITIONS (priority order):
     SELL: mid >= entry_price + EDGE_THRESHOLD  (YES price rising against our short)
 
   EXIT 3 — TIME EXIT (unchanged)
-    16:00 SGT hard close, all positions, best available price.
+    16:00 local-time hard close (per-city, see HARD_EXIT_HOUR/`timezone`
+    param), all positions, best available price.
 
 TRAIL_PCT is configurable via env var TRAIL_PCT (default 0.20).
 Set lower (e.g. 0.10) for tighter stops on thin books.
@@ -46,6 +47,7 @@ Updated every Job 5 cycle when a new high/low is observed.
 import os
 import logging
 import datetime
+import pytz
 from typing import Any, Dict, List, Optional
 
 from py_clob_client_v2.client import ClobClient
@@ -58,9 +60,13 @@ from core.execution import _is_ghost_book
 
 logger = logging.getLogger("hermes.monitor")
 
-HARD_EXIT_HOUR_SGT = 16
-EDGE_THRESHOLD     = 0.05   # injected by scheduler from env
-TRAIL_PCT          = float(os.getenv("TRAIL_PCT", 0.20))
+# Hour (in the city's own local time — see PositionMonitor's `timezone` param)
+# at which any still-open position is force-closed regardless of trailing
+# stop / stop loss state. Was hardcoded to a fixed UTC+8 offset ("SGT"); now
+# resolved per-city via pytz so a city outside UTC+8 gets a correct cutoff.
+HARD_EXIT_HOUR   = 16
+EDGE_THRESHOLD   = 0.05   # injected by scheduler from env
+TRAIL_PCT        = float(os.getenv("TRAIL_PCT", 0.20))
 
 
 class ExitReason:
@@ -374,6 +380,7 @@ class PositionMonitor:
         trail_pct:      float = TRAIL_PCT,
         icao:           str   = "WSSS",
         paper_trading:  bool  = False,
+        timezone:       str   = "Asia/Singapore",
     ):
         self.client         = client
         self.ledger         = ledger
@@ -384,6 +391,9 @@ class PositionMonitor:
         # exit order book is still fetched for a realistic exit price, but
         # no real order is created or posted when this is True.
         self.paper_trading  = paper_trading
+        # IANA tz name (CityConfig.timezone) — anchors HARD_EXIT_HOUR and the
+        # per-position force_time_exit check to this city's own local time.
+        self.timezone       = pytz.timezone(timezone)
 
     def run(self, model_probs: Dict[str, float], market_date: str = "") -> List[Dict]:
         """
@@ -391,8 +401,8 @@ class PositionMonitor:
         Used to scope the 16:00 hard time-exit to genuinely STALE positions
         only — see per-position force_time_exit logic below.
         """
-        sg_now         = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
-        hour_cutoff    = sg_now.hour >= HARD_EXIT_HOUR_SGT
+        local_now      = datetime.datetime.now(pytz.utc).astimezone(self.timezone)
+        hour_cutoff    = local_now.hour >= HARD_EXIT_HOUR
         open_positions = self.ledger.get_open_positions(self.icao)
         results        = []
 
@@ -434,13 +444,15 @@ class PositionMonitor:
             # stop / stop loss protection applies until either it closes
             # naturally or tomorrow's stale-position rule catches it.
             try:
-                opened_at_utc = datetime.datetime.fromisoformat(opened_at)
-                opened_at_sgt = opened_at_utc + datetime.timedelta(hours=8)
+                opened_at_utc   = datetime.datetime.fromisoformat(opened_at)
+                if opened_at_utc.tzinfo is None:
+                    opened_at_utc = pytz.utc.localize(opened_at_utc)
+                opened_at_local = opened_at_utc.astimezone(self.timezone)
             except (ValueError, TypeError):
-                opened_at_sgt = None
+                opened_at_local = None
 
-            today_cutoff_sgt = sg_now.replace(
-                hour=HARD_EXIT_HOUR_SGT, minute=0, second=0, microsecond=0
+            today_cutoff_local = local_now.replace(
+                hour=HARD_EXIT_HOUR, minute=0, second=0, microsecond=0
             )
 
             if pos_market_date and market_date and pos_market_date < market_date:
@@ -451,11 +463,11 @@ class PositionMonitor:
                     f"[MONITOR] {position_label}: stale position from {pos_market_date} "
                     f"(today is {market_date}) — forcing exit regardless of hour"
                 )
-            elif opened_at_sgt is not None:
+            elif opened_at_local is not None:
                 # Same day (or unknown market_date) — only force-exit if this
                 # position existed before today's cutoff AND the cutoff has
                 # now passed. A position opened after 16:00 is exempt today.
-                force_time_exit = (opened_at_sgt < today_cutoff_sgt) and (sg_now >= today_cutoff_sgt)
+                force_time_exit = (opened_at_local < today_cutoff_local) and (local_now >= today_cutoff_local)
             else:
                 # opened_at unparseable — fall back to the old global
                 # behaviour rather than silently never force-exiting.

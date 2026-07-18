@@ -40,6 +40,7 @@ import logging
 import datetime
 import requests
 from typing import Dict, Optional
+from urllib.parse import quote
 
 from db.ledger import Ledger
 
@@ -50,7 +51,7 @@ OPEN_METEO_HIST_URL = (
     "https://archive-api.open-meteo.com/v1/archive"
     "?latitude={lat}&longitude={lon}"
     "&daily=temperature_2m_max"
-    "&timezone=Asia%2FSingapore"
+    "&timezone={timezone}"
     "&start_date={date}&end_date={date}"
 )
 
@@ -223,7 +224,10 @@ class SettlementEngine:
 
         # ── Fallback: Open-Meteo archive ──────────────────────────────────────
         try:
-            url  = OPEN_METEO_HIST_URL.format(lat=self.city_config.lat, lon=self.city_config.lon, date=date)
+            url  = OPEN_METEO_HIST_URL.format(
+                lat=self.city_config.lat, lon=self.city_config.lon,
+                timezone=quote(self.city_config.timezone, safe=""), date=date,
+            )
             resp = requests.get(url, timeout=self.timeout)
             resp.raise_for_status()
             data = resp.json()

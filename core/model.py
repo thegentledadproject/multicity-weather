@@ -37,22 +37,22 @@ import requests
 import numpy as np
 from scipy.stats import skewnorm
 from typing import Dict, Optional, Tuple
+from urllib.parse import quote
 
 logger = logging.getLogger("hermes.model")
 
 # ── Open-Meteo ensemble API ─────────────────────────────────────────────────
 # GFS: 31 members | ECMWF: 50 members
-# Both available free, no API key required. Timezone left as Singapore for
-# the shared template's default — callers that need a different tz can
-# still get correct UTC-anchored peak-hour data since hourly timestamps are
-# ISO and peak-hour extraction (06:00-21:00) is a local-time convention
-# specific to WSSS's usage; other cities should verify this window applies.
+# Both available free, no API key required. Timezone is now parameterized
+# per-city (CityConfig.timezone) rather than hardcoded to Singapore — the
+# peak-hour extraction (06:00-21:00) is a local-time convention, so a city
+# in a different UTC offset needs its own tz to anchor the window correctly.
 _ENSEMBLE_BASE = (
     "https://ensemble-api.open-meteo.com/v1/ensemble"
     "?latitude={lat}&longitude={lon}"
     "&hourly=temperature_2m"
     "&models={model}"
-    "&timezone=Asia%2FSingapore"
+    "&timezone={timezone}"
     "&forecast_days=1"
 )
 GFS_ENSEMBLE_URL    = _ENSEMBLE_BASE.replace("{model}", "gfs_seamless")
@@ -75,7 +75,7 @@ OPEN_METEO_FORECAST_URL = (
     "https://api.open-meteo.com/v1/forecast"
     "?latitude={lat}&longitude={lon}"
     "&daily=temperature_2m_max,temperature_2m_min"
-    "&timezone=Asia%2FSingapore"
+    "&timezone={timezone}"
     "&forecast_days=1"
     "&models=gfs_seamless"
 )
@@ -116,7 +116,7 @@ class ForecastResult:
 
 
 def _fetch_ensemble_members(
-    url: str, lat: float, lon: float, timeout: int, model_name: str,
+    url: str, lat: float, lon: float, timezone: str, timeout: int, model_name: str,
 ) -> Optional[Tuple[float, float, int]]:
     """
     Fetch ensemble members from Open-Meteo and compute (mu, sigma, n_members).
@@ -128,7 +128,7 @@ def _fetch_ensemble_members(
     sigma = std dev of member daily maxes (ddof=1), clipped to [0.30, 2.00]
     """
     try:
-        resp = requests.get(url.format(lat=lat, lon=lon), timeout=timeout)
+        resp = requests.get(url.format(lat=lat, lon=lon, timezone=quote(timezone, safe="")), timeout=timeout)
         resp.raise_for_status()
         data   = resp.json()
         hourly = data.get("hourly", {})
@@ -238,6 +238,7 @@ def _blend(
 def fetch_gfs_forecast(
     lat: float,
     lon: float,
+    timezone: str = "Asia/Singapore",
     hard_prior_mu: float = 31.5,
     hard_prior_sigma: float = 1.0,
     timeout: int = 15,
@@ -245,6 +246,9 @@ def fetch_gfs_forecast(
     """
     Fetch dual-source forecast for the given coordinates and return a
     blended ForecastResult.
+
+    timezone: IANA tz name (e.g. "Asia/Kuala_Lumpur") used to anchor the
+    06:00-21:00 peak-heating window to the city's own local time.
 
     Pipeline:
       1. Fetch GFS 31-member ensemble (parallel-capable but sequential here)
@@ -255,8 +259,8 @@ def fetch_gfs_forecast(
     """
 
     # ── Fetch both ensemble sources ───────────────────────────────────────────
-    gfs_result   = _fetch_ensemble_members(GFS_ENSEMBLE_URL,   lat, lon, timeout, "GFS")
-    ecmwf_result = _fetch_ensemble_members(ECMWF_ENSEMBLE_URL, lat, lon, timeout, "ECMWF")
+    gfs_result   = _fetch_ensemble_members(GFS_ENSEMBLE_URL,   lat, lon, timezone, timeout, "GFS")
+    ecmwf_result = _fetch_ensemble_members(ECMWF_ENSEMBLE_URL, lat, lon, timezone, timeout, "ECMWF")
 
     blended = _blend(gfs_result, ecmwf_result)
     if blended.source != "none":
@@ -265,7 +269,7 @@ def fetch_gfs_forecast(
     # ── Fallback 1: standard forecast API (GFS deterministic) ────────────────
     logger.warning("[MODEL] Both ensemble sources failed — trying standard GFS forecast API")
     try:
-        url  = OPEN_METEO_FORECAST_URL.format(lat=lat, lon=lon)
+        url  = OPEN_METEO_FORECAST_URL.format(lat=lat, lon=lon, timezone=quote(timezone, safe=""))
         resp = requests.get(url, timeout=timeout)
         resp.raise_for_status()
         data  = resp.json()

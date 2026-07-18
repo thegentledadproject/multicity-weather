@@ -53,7 +53,8 @@ GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 
 # Regex patterns to extract temperature from market question.
 # Range widened to 26-39°C (was 28-39) to cover the full 11-outcome
-# bracket sets in config.cities.CITIES (WSSS: 26-36°C, WMKK: 27-37°C).
+# bracket sets in config.cities.CITIES (WSSS and WMKK both 26-36°C —
+# see CityConfig.bracket_bounds for the authoritative per-city ranges).
 _TEMP_PATTERNS = [
     re.compile(r'\b(2[6-9]|3[0-9])°?[Cc]\b'),      # "32°C" or "32C"
     re.compile(r'\b(2[6-9]|3[0-9])\s*degrees\b'),   # "32 degrees"
