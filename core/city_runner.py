@@ -19,6 +19,13 @@ State shared across a city's own jobs (in-process dict, not DB):
       "model_mu":      float,
       "market_date":   str,   # refreshed every 20 min by Job 1 — rolls over
                                # across local midnight automatically.
+      "next_token_matrix": {label: token_id},  # evening lookahead cache —
+      "next_market_date":  str,                # see job_market_discovery's
+                                                # lookahead probe. Only ever
+                                                # promoted into token_matrix/
+                                                # market_date above once the
+                                                # real local date catches up;
+                                                # Jobs 2/3/4/5 never read these.
   }
 
 The CLOB client and Ledger are shared singletons injected by scheduler.py
@@ -27,6 +34,7 @@ construction (scheduler.main() builds it once, then hands it to every
 runner), since build_client() must succeed before any runner can use it.
 """
 
+import os
 import logging
 import datetime
 
@@ -42,6 +50,14 @@ from core.settlement    import SettlementEngine
 from core.position_monitor import PositionMonitor
 
 logger = logging.getLogger("hermes.city_runner")
+
+# Local hour (city's own timezone) after which Job 1 also probes for the
+# NEXT calendar day's market — Polymarket launches each day's market
+# ~23:00 local, the evening before, so 22:00 gives an hour of buffer for
+# an early launch. Discovery-only: this just caches the matrix so the
+# real rollover (below) can reuse it instead of a fresh fetch — it does
+# NOT make Jobs 2/3/4/5 trade the next day's market early.
+LOOKAHEAD_START_HOUR = int(os.getenv("LOOKAHEAD_START_HOUR", "22"))
 
 
 class CityRunner:
@@ -73,6 +89,8 @@ class CityRunner:
             "model_probs":  {},
             "model_mu":     config.hard_prior_mu,
             "market_date":  "",
+            "next_token_matrix": {},
+            "next_market_date":  "",
         }
 
     def _local_now(self) -> datetime.datetime:
@@ -92,7 +110,18 @@ class CityRunner:
             logger.info(f"[JOB1:{self.icao}] Date rollover detected: {prior_date} → {date}")
 
         discovery = MarketDiscovery(self.ledger, self.config)
-        matrix    = discovery.run()
+
+        # ── Promote from the lookahead cache if it already covers today ──────
+        # See the evening lookahead probe below — if Job 1 already discovered
+        # today's market last night (before real local midnight), reuse that
+        # confirmed-live matrix instead of a redundant fresh Gamma fetch.
+        if self._state.get("next_market_date") == date:
+            logger.info(f"[JOB1:{self.icao}] Promoting lookahead-cached matrix for {date}")
+            matrix = self._state["next_token_matrix"]
+            self._state["next_token_matrix"] = {}
+            self._state["next_market_date"]  = ""
+        else:
+            matrix = discovery.run()
 
         if not matrix:
             # Not an error on every tick — this runs every 20 min, so a miss
@@ -113,6 +142,27 @@ class CityRunner:
         self._state["token_matrix"] = matrix
         self._state["market_date"]  = date
         logger.info(f"[JOB1:{self.icao}] Token matrix: {list(matrix.keys())}")
+
+        # ── Evening lookahead probe ───────────────────────────────────────
+        # Polymarket launches each day's market ~23:00 local, the evening
+        # before. From LOOKAHEAD_START_HOUR onward, also try to discover
+        # TOMORROW's market and cache it — so the promotion above can reuse
+        # it instead of a fresh fetch right at the rollover moment. This
+        # does NOT change what Jobs 2/3/4/5 trade on: token_matrix/
+        # market_date above still only reflect the real current day.
+        if local_now.hour >= LOOKAHEAD_START_HOUR:
+            tomorrow = (local_now + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+            if self._state.get("next_market_date") != tomorrow:
+                next_matrix = discovery.run(date=tomorrow)
+                if next_matrix:
+                    logger.info(
+                        f"[JOB1:{self.icao}] Lookahead: found {tomorrow}'s market "
+                        f"live early ({list(next_matrix.keys())})"
+                    )
+                    self._state["next_token_matrix"] = next_matrix
+                    self._state["next_market_date"]  = tomorrow
+                else:
+                    logger.info(f"[JOB1:{self.icao}] Lookahead: {tomorrow}'s market not live yet")
 
     # ══════════════════════════════════════════════════════════════════════
     # JOB 2 — Signal Scan (every 15 min, 24/7)

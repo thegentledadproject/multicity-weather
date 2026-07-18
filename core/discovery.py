@@ -156,13 +156,21 @@ class MarketDiscovery:
             slugs.append(template.format(month=mon_l, day=day_pad, year=year))
         return slugs
 
-    def run(self) -> Dict[str, Dict[str, str]]:
+    def run(self, date: Optional[str] = None) -> Dict[str, Dict[str, str]]:
         """
         Main entry point. Returns {bracket_label: {"yes": token_id, "no": no_token_id}}
-        for today. Writes results to DB. Falls back to last known DB matrix
-        if API fails entirely.
+        for the given date (defaults to this city's own today, via
+        self._today_str()). Writes results to DB. Falls back to last known
+        DB matrix if API fails entirely.
+
+        date: optional YYYY-MM-DD override, used by core/city_runner.py's
+        Job 1 lookahead probe to search for TOMORROW's market during the
+        evening window before it becomes "today" — Polymarket launches
+        each day's market ~23:00 local, the evening before. Not intended
+        for general use; every other caller should omit this and get the
+        city's real current date.
         """
-        today = self._today_str()
+        today = date or self._today_str()
         logger.info(f"[DISCOVERY] {self.icao}: running market discovery for {today}")
 
         token_matrix = self._fetch_from_gamma(today)
