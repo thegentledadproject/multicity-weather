@@ -5,12 +5,15 @@ Ported from Hermes v4.3 with all BUG fixes applied.
 Execution flow per bracket:
   1. Compute-time VWAP from the order book's ask side (both directions are
      a BUY — see below)
-  2. Kelly sizing decision
-  3. Pre-execution VWAP revalidation (re-fetch book)
-  4. Drift check: abort if book moved > VWAP_DRIFT_TOLERANCE
-  5. Build and sign MarketOrderArgs (FOK)
-  6. post_order() → parse fill status
-  7. Record position in DB only on confirmed fill
+  2. Signal-staleness check: abort if this VWAP has diverged from the price
+     Job 2's edge signal was computed against by more than
+     SIGNAL_STALENESS_TOLERANCE (see that constant's docstring below)
+  3. Kelly sizing decision
+  4. Pre-execution VWAP revalidation (re-fetch book)
+  5. Drift check: abort if book moved > VWAP_DRIFT_TOLERANCE
+  6. Build and sign MarketOrderArgs (FOK)
+  7. post_order() → parse fill status
+  8. Record position in DB only on confirmed fill
 
 BUY (YES):  Side.BUY on the YES token — fills from its ask side.
 SELL (NO):  Side.BUY on the NO token — fills from its ask side.
@@ -45,6 +48,34 @@ from core.sizing import SizingResult
 logger = logging.getLogger("hermes.execution")
 
 VWAP_DRIFT_TOLERANCE = 0.03   # Abort if book moves > 3% between compute and exec
+
+# Signal-staleness check: Job 2 computes an edge signal against a price
+# snapshot, then Job 3 executes ~2 min later (by cron offset — can be more
+# if a cycle runs long) against a FRESH, independently-fetched order book.
+# VWAP_DRIFT_TOLERANCE above only compares this function's own two
+# back-to-back fetches (book_1 vs book_2, seconds apart) — it says nothing
+# about how far the book has moved since Job 2's signal was computed.
+#
+# Confirmed root cause of a real loss: an unsorted ask-book bug (see
+# _extract_vwap_ask's docstring) made a thin bracket's compute-time VWAP
+# read 0.999 when Job 2's signal had priced the same bracket at ~0.07
+# two minutes earlier — a stale/wrong VWAP that the intra-execute() drift
+# check could never catch, since both of THIS function's own reads agreed
+# with each other (just not with reality). Sorting the book fixed that
+# specific bug, but nothing stopped a DIFFERENT bad-book state or a
+# genuine fast repricing from producing the same outcome — this check is
+# the general guard: if the execution-time price has moved further than
+# this tolerance from what justified the trade, abort and retry next
+# cycle rather than trade on a signal that may no longer be true.
+#
+# Expressed as an absolute price-point gap (not a relative percentage):
+# relative drift blows up misleadingly near 0 or 1 (e.g. 0.001 -> 0.01 is
+# "900% relative drift" from a move of one cent), so an absolute
+# probability-point tolerance is the more stable measure across the full
+# 0-1 price range weather brackets span. 0.15 is generous enough to allow
+# genuine repricing over a few minutes but catches a jump like 0.07->0.999
+# immediately.
+SIGNAL_STALENESS_TOLERANCE = float(os.getenv("SIGNAL_STALENESS_TOLERANCE", "0.15"))
 
 # Pre-order balance-propagation poll: how many times to re-check
 # get_balance_allowance() after update_balance_allowance() before giving up
@@ -377,6 +408,32 @@ class ExecutionEngine:
         if not vwap_compute:
             logger.warning(f"[EXEC] {label} {direction}: no book depth at compute — abort")
             return False
+
+        # ── Signal-staleness check ────────────────────────────────────────────
+        # signal.market_price is the YES book snapshot Job 2 priced this edge
+        # against, up to a full scan cycle ago. Reconstruct the reference
+        # price for whichever side we're actually executing:
+        #   BUY      → signal.market_price.best_ask directly (same token)
+        #   SELL/NO  → 1 - best_bid (the same effective_ask estimate
+        #              core/city_runner.py's Kelly sizing already uses — the
+        #              NO token's own signal-time price isn't separately
+        #              fetched, so this is the best available reference)
+        # See SIGNAL_STALENESS_TOLERANCE's docstring for why this exists and
+        # why it's an absolute point gap, not a relative one.
+        if signal.market_price is not None:
+            reference_price = (
+                signal.market_price.best_ask if direction == "BUY"
+                else 1.0 - signal.market_price.best_bid
+            )
+            staleness = abs(vwap_compute - reference_price)
+            if staleness > SIGNAL_STALENESS_TOLERANCE:
+                logger.error(
+                    f"[EXEC] {label} {direction}: signal stale — compute-time VWAP "
+                    f"{vwap_compute:.4f} vs signal-time reference {reference_price:.4f} "
+                    f"({staleness:.4f} > {SIGNAL_STALENESS_TOLERANCE:.2f} tolerance) — "
+                    f"abort, will retry next cycle with a fresh signal"
+                )
+                return False
 
         # ── PM-4: Pre-execution VWAP revalidation ─────────────────────────────
         book_2 = self.client.get_order_book(exec_token_id)
