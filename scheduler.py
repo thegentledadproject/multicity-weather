@@ -223,7 +223,13 @@ def main():
         runner.job_market_discovery()
 
     # ── Scheduler setup ────────────────────────────────────────────────────────
-    max_workers = max(3, 3 * len(_runners))
+    # Worst-case concurrent jobs per city, from the cron minutes below: at
+    # :00/:20 local, Market Discovery + Signal Scan + Position Monitor all
+    # coincide (3 jobs). The old max(3, 3*N) sizing matched that worst case
+    # exactly with zero headroom — any one job running long at that moment
+    # would queue the rest behind it rather than run them concurrently.
+    # 5*N leaves ~65% headroom over the 3*N worst case.
+    max_workers = max(6, 5 * len(_runners))
     executors   = {"default": ThreadPoolExecutor(max_workers=max_workers)}
     scheduler   = BlockingScheduler(executors=executors, timezone="UTC")
 
