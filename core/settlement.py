@@ -243,14 +243,15 @@ class SettlementEngine:
 
         return None
 
-    def expire_stale(self) -> int:
+    def find_stuck(self) -> int:
         """
-        PM-5: expire positions older than 28h.
+        PM-5: count (never delete) this city's positions open longer than
+        28h — see db/ledger.py's find_stuck_positions() docstring.
 
-        NOTE: currently dead code — scheduler.py's Job 3 calls
-        ledger.expire_stale_positions() directly, bypassing this wrapper
+        NOTE: currently dead code — core/city_runner.py's Job 5 calls
+        ledger.find_stuck_positions() directly, bypassing this wrapper
         entirely. Harmless (just unused), kept here in case a future
         caller wants it via SettlementEngine rather than the raw ledger.
         """
-        expired = self.ledger.expire_stale_positions(ttl_hours=28)
-        return len(expired)
+        stuck = self.ledger.find_stuck_positions(self.icao, ttl_hours=28)
+        return len(stuck)

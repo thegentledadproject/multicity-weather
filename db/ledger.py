@@ -90,6 +90,7 @@ class Ledger:
                     icao_code       TEXT    NOT NULL DEFAULT 'WSSS',
                     bracket_label   TEXT    NOT NULL,
                     token_id        TEXT    NOT NULL,
+                    no_token_id     TEXT    NOT NULL DEFAULT '',
                     market_date     TEXT    NOT NULL,
                     updated_at      TEXT    NOT NULL,
                     PRIMARY KEY (icao_code, bracket_label)
@@ -135,6 +136,7 @@ class Ledger:
                 ("open_positions",   "market_date", "''"),
                 ("signal_log",       "icao_code",   "'WSSS'"),
                 ("exit_log",         "icao_code",   "'WSSS'"),
+                ("token_matrix",     "no_token_id", "''"),
             ]:
                 cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})")]
                 if col not in cols:
@@ -163,12 +165,13 @@ class Ledger:
                         icao_code       TEXT    NOT NULL DEFAULT 'WSSS',
                         bracket_label   TEXT    NOT NULL,
                         token_id        TEXT    NOT NULL,
+                        no_token_id     TEXT    NOT NULL DEFAULT '',
                         market_date     TEXT    NOT NULL,
                         updated_at      TEXT    NOT NULL,
                         PRIMARY KEY (icao_code, bracket_label)
                     );
-                    INSERT INTO token_matrix (icao_code, bracket_label, token_id, market_date, updated_at)
-                        SELECT 'WSSS', bracket_label, token_id, market_date, updated_at FROM token_matrix_old;
+                    INSERT INTO token_matrix (icao_code, bracket_label, token_id, no_token_id, market_date, updated_at)
+                        SELECT 'WSSS', bracket_label, token_id, no_token_id, market_date, updated_at FROM token_matrix_old;
                     DROP TABLE token_matrix_old;
                 """)
 
@@ -259,23 +262,33 @@ class Ledger:
 
     # ── Token matrix (refreshed daily by discovery job) ──────────────────────
 
-    def upsert_token_matrix(self, bracket_label: str, token_id: str, market_date: str, icao: str = "WSSS"):
+    def upsert_token_matrix(
+        self, bracket_label: str, token_id: str, no_token_id: str, market_date: str, icao: str = "WSSS",
+    ):
+        """
+        no_token_id: the bracket's NO outcome token — needed to open/close NO
+        positions via a real BUY on the NO token, rather than a naked (and
+        unsupported) sell of YES. May be '' for a stale/pre-migration row;
+        callers must handle that (see core/execution.py's execute()).
+        """
         ts = datetime.datetime.utcnow().isoformat()
         with self._conn() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO token_matrix "
-                "(icao_code, bracket_label, token_id, market_date, updated_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (icao.upper(), bracket_label, token_id, market_date, ts),
+                "(icao_code, bracket_label, token_id, no_token_id, market_date, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (icao.upper(), bracket_label, token_id, no_token_id, market_date, ts),
             )
 
-    def get_token_matrix(self, market_date: str, icao: str = "WSSS") -> Dict[str, str]:
+    def get_token_matrix(self, market_date: str, icao: str = "WSSS") -> Dict[str, Dict[str, str]]:
+        """Returns {bracket_label: {"yes": token_id, "no": no_token_id}}."""
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT bracket_label, token_id FROM token_matrix WHERE market_date = ? AND icao_code = ?",
+                "SELECT bracket_label, token_id, no_token_id FROM token_matrix "
+                "WHERE market_date = ? AND icao_code = ?",
                 (market_date, icao.upper()),
             ).fetchall()
-        return {r["bracket_label"]: r["token_id"] for r in rows}
+        return {r["bracket_label"]: {"yes": r["token_id"], "no": r["no_token_id"]} for r in rows}
 
     # ── Positions ─────────────────────────────────────────────────────────────
 
@@ -370,23 +383,38 @@ class Ledger:
             logger.error(f"[-] get_peak_price failed for {token_id}: {e}")
             return 0.0
 
-    def expire_stale_positions(self, ttl_hours: int = 28) -> List[str]:
-        cutoff  = (datetime.datetime.utcnow() - datetime.timedelta(hours=ttl_hours)).isoformat()
-        expired = []
+    def find_stuck_positions(self, icao: str, ttl_hours: int = 28) -> List[sqlite3.Row]:
+        """
+        Returns this city's open_positions rows that have been open longer
+        than ttl_hours — for ALERTING only. Does NOT delete or otherwise
+        touch them.
+
+        Replaces the old expire_stale_positions(), which silently DELETEd
+        these rows without ever placing a closing order. A position open
+        this long means core/position_monitor.py's own per-position
+        force_time_exit logic (which already retries a REAL close every
+        Job 5 cycle for anything carried over from a prior market_date)
+        has been failing to actually close it — thin book, repeated FOK
+        rejections, or a bug. The wallet still holds the real shares.
+        Confirmed in production (single-city predecessor of this codebase):
+        two positions vanished from the dashboard while still sitting open,
+        unmanaged (no more trailing stop/stop loss), and visibly held in the
+        Polymarket wallet UI the whole time — the old delete-only behaviour
+        hid a live, unmanaged financial exposure instead of surfacing it.
+
+        Job 5 (core/city_runner.py's job_position_monitor) keeps retrying a
+        genuine close every cycle regardless of whether this method is ever
+        called; this only surfaces "something has been stuck a long time"
+        so an operator can investigate manually if those retries keep failing.
+        """
+        cutoff = (datetime.datetime.utcnow() - datetime.timedelta(hours=ttl_hours)).isoformat()
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT token_id, bracket_label FROM open_positions WHERE opened_at < ?",
-                (cutoff,),
+                "SELECT token_id, bracket_label, opened_at FROM open_positions "
+                "WHERE icao_code = ? AND opened_at < ?",
+                (icao.upper(), cutoff),
             ).fetchall()
-            for row in rows:
-                conn.execute(
-                    "DELETE FROM open_positions WHERE token_id = ?", (row["token_id"],)
-                )
-                expired.append(row["token_id"])
-                logger.warning(
-                    f"[LEDGER] TTL-expired: {row['bracket_label']} ({row['token_id']})"
-                )
-        return expired
+        return rows
 
     # ── Signal log ────────────────────────────────────────────────────────────
 

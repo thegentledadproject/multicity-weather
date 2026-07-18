@@ -91,9 +91,13 @@ from core.city_runner  import CityRunner
 from config.cities     import CITIES, resolve_vault_usd
 
 # ── Config from environment ────────────────────────────────────────────────────
-DB_PATH        = os.getenv("DB_PATH",              "hermes.db")
-EDGE_THRESHOLD = float(os.getenv("EDGE_THRESHOLD", 0.05))
-TRAIL_PCT      = float(os.getenv("TRAIL_PCT", 0.20))
+DB_PATH            = os.getenv("DB_PATH",              "hermes.db")
+EDGE_THRESHOLD     = float(os.getenv("EDGE_THRESHOLD", 0.05))
+TRAIL_PCT          = float(os.getenv("TRAIL_PCT", 0.20))
+# See core/edge.py's module docstring — gates signals whose |edge| implies
+# near-certainty against the market as likely model miscalibration, not a
+# genuine opportunity, rather than sizing and trading them.
+MAX_EDGE_MAGNITUDE = float(os.getenv("MAX_EDGE_MAGNITUDE", 0.50))
 
 # VALIDATION_MODE: forces $1 trades on any actionable signal, bypassing
 # Kelly sizing and EV hurdles entirely. Full lifecycle (entry, trailing
@@ -133,12 +137,13 @@ def _build_runners() -> dict:
         vault_usd       = resolve_vault_usd(config)
         validation_mode = _resolve_validation_mode(icao)
         runners[icao] = CityRunner(
-            config          = config,
-            ledger          = _ledger,
-            vault_usd       = vault_usd,
-            edge_threshold  = EDGE_THRESHOLD,
-            trail_pct       = TRAIL_PCT,
-            validation_mode = validation_mode,
+            config             = config,
+            ledger             = _ledger,
+            vault_usd          = vault_usd,
+            edge_threshold     = EDGE_THRESHOLD,
+            trail_pct          = TRAIL_PCT,
+            validation_mode    = validation_mode,
+            max_edge_magnitude = MAX_EDGE_MAGNITUDE,
         )
         if config.paper_trading:
             mode = " [PAPER TRADING]"
@@ -193,6 +198,24 @@ def main():
 
     for runner in _runners.values():
         runner.client = _client
+
+    # Sync the CLOB's internal balance/allowance cache for the deposit wallet
+    # against actual on-chain state. Without this, order placement can fail
+    # with "not enough balance / allowance ... balance: 0" even when the
+    # wallet is genuinely funded — the cache does not track on-chain changes
+    # automatically and can go stale across ordinary bot restarts, not just
+    # after funding. Account-wide (one shared wallet across every city), so
+    # a single call at startup suffices. Best-effort: log and continue on
+    # failure rather than blocking startup.
+    try:
+        from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
+        _client.update_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+        logger.info("[INIT] Balance/allowance cache synced ✓")
+    except Exception as e:
+        logger.warning(
+            f"[INIT] Balance/allowance sync failed: {e} — orders may fail with "
+            f"a stale-balance error until the next successful sync."
+        )
 
     # Run discovery immediately on startup so jobs 2/3 have tokens from the start
     for icao, runner in _runners.items():

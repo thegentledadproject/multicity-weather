@@ -35,7 +35,7 @@ import pytz
 from db.ledger       import Ledger
 from core.discovery  import MarketDiscovery
 from core.model      import BracketModel, fetch_gfs_forecast
-from core.edge       import scan_all_brackets
+from core.edge       import scan_all_brackets, MAX_EDGE_MAGNITUDE
 from core.sizing     import compute_size, compute_validation_size
 from core.execution  import ExecutionEngine
 from core.settlement    import SettlementEngine
@@ -53,14 +53,16 @@ class CityRunner:
         edge_threshold: float,
         trail_pct: float,
         validation_mode: bool = False,
+        max_edge_magnitude: float = MAX_EDGE_MAGNITUDE,
     ):
-        self.config          = config
-        self.icao            = config.icao
-        self.ledger          = ledger
-        self.vault_usd       = vault_usd            # already this city's allocated slice
-        self.edge_threshold  = edge_threshold
-        self.trail_pct       = trail_pct
-        self.validation_mode = validation_mode
+        self.config             = config
+        self.icao               = config.icao
+        self.ledger             = ledger
+        self.vault_usd          = vault_usd            # already this city's allocated slice
+        self.edge_threshold     = edge_threshold
+        self.trail_pct          = trail_pct
+        self.validation_mode    = validation_mode
+        self.max_edge_magnitude = max_edge_magnitude
 
         self.client = None   # set by scheduler.main() once build_client() succeeds
 
@@ -150,9 +152,10 @@ class CityRunner:
         self._state["model_mu"]    = forecast.mu
 
         signals = scan_all_brackets(
-            token_matrix   = token_matrix,
-            model_probs    = model_probs,
-            edge_threshold = self.edge_threshold,
+            token_matrix       = token_matrix,
+            model_probs        = model_probs,
+            edge_threshold     = self.edge_threshold,
+            max_edge_magnitude = self.max_edge_magnitude,
         )
         self._state["signals"] = signals
 
@@ -202,11 +205,6 @@ class CityRunner:
         if not actionable:
             logger.info(f"[JOB3:{self.icao}] No actionable signals this cycle.")
             return
-
-        # Expire stale positions before execution — TTL-based, city-agnostic,
-        # harmless to call once per city's cycle (idempotent no-op past the
-        # first city that ticks in a given window).
-        self.ledger.expire_stale_positions(ttl_hours=28)
 
         trailing_bias = self.ledger.fetch_trailing_bias(self.icao)
         engine        = ExecutionEngine(
@@ -293,6 +291,22 @@ class CityRunner:
     # ══════════════════════════════════════════════════════════════════════
     def job_position_monitor(self):
         logger.info(f"[JOB5:{self.icao}] ── Position Monitor ──")
+
+        # Alert on (never silently delete) positions open far longer than
+        # expected. Runs first, unconditionally — before the client/open-
+        # positions checks below — so it fires every cycle regardless of
+        # client state. See db/ledger.py's find_stuck_positions() docstring
+        # for the incident this replaced (silent deletion of still-open,
+        # unmanaged real-money positions by the old expire_stale_positions()).
+        for stuck in self.ledger.find_stuck_positions(self.icao, ttl_hours=28):
+            logger.critical(
+                f"[JOB5:{self.icao}] STUCK POSITION: {stuck['bracket_label']} "
+                f"({stuck['token_id']}) opened_at={stuck['opened_at']} has been "
+                f"open >28h. This job should be retrying its exit every cycle — "
+                f"if this keeps recurring, investigate manually (book depth? "
+                f"repeated FOK rejections? a bug?). Polymarket's own wallet UI "
+                f"still shows these shares as held."
+            )
 
         if self.client is None:
             logger.error(f"[JOB5:{self.icao}] CLOB client not initialised — skipping.")
