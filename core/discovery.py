@@ -43,6 +43,7 @@ import json
 import logging
 import datetime
 import requests
+import pytz
 from typing import Dict, List, Optional
 
 from db.ledger import Ledger
@@ -76,17 +77,26 @@ def _parse_clob_token_ids(market: dict) -> List[str]:
     except (json.JSONDecodeError, TypeError):
         return []
 
-def _today_str() -> str:
-    sg_now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
-    return sg_now.strftime("%Y-%m-%d")
-
-
 class MarketDiscovery:
     def __init__(self, ledger: Ledger, city_config, timeout: int = 15):
         self.ledger      = ledger
         self.city_config = city_config
         self.icao        = city_config.icao
         self.timeout     = timeout
+
+    def _today_str(self) -> str:
+        """
+        This city's own current calendar date, in its own local timezone.
+
+        Was a module-level function hardcoded to a fixed UTC+8 ("SGT")
+        offset — worked for WSSS/WMKK only by coincidence (both happen to
+        sit at UTC+8) and silently diverged from core/city_runner.py's own
+        (correctly per-city) market_date around any non-UTC+8 city's local
+        midnight, since that caller computes its date independently via
+        self._local_now() rather than passing it into MarketDiscovery.run().
+        """
+        local_now = datetime.datetime.now(pytz.timezone(self.city_config.timezone))
+        return local_now.strftime("%Y-%m-%d")
 
     def _extract_temp_label(self, question: str) -> Optional[str]:
         """Extract a bracket label like '32°C' from a market question string."""
@@ -152,7 +162,7 @@ class MarketDiscovery:
         for today. Writes results to DB. Falls back to last known DB matrix
         if API fails entirely.
         """
-        today = _today_str()
+        today = self._today_str()
         logger.info(f"[DISCOVERY] {self.icao}: running market discovery for {today}")
 
         token_matrix = self._fetch_from_gamma(today)
@@ -336,7 +346,7 @@ class MarketDiscovery:
         if not token_matrix:
             return False
 
-        today = _today_str()
+        today = self._today_str()
         slugs = self._build_slugs(today)
         live: Dict[str, Dict[str, str]] = {}
         try:
