@@ -35,6 +35,7 @@ runner), since build_client() must succeed before any runner can use it.
 """
 
 import os
+import time
 import logging
 import datetime
 
@@ -126,7 +127,11 @@ class CityRunner:
         if not matrix:
             # Not an error on every tick — this runs every 20 min, so a miss
             # just means retry in 20 min rather than a full day gap.
-            if self._state.get("token_matrix"):
+            if discovery.invalid_reason:
+                logger.error(f"[JOB1:{self.icao}] Settlement gate: {discovery.invalid_reason} — "
+                             "clearing matrix, no entries.")
+                self._state["signals"] = {}
+            elif self._state.get("token_matrix"):
                 logger.warning(
                     f"[JOB1:{self.icao}] No fresh tokens found this cycle — keeping "
                     "previously cached matrix until next retry."
@@ -172,6 +177,8 @@ class CityRunner:
         logger.info(f"[JOB2:{self.icao}] ── Signal Scan @ {local_now_str} ──")
 
         token_matrix = self._state.get("token_matrix", {})
+        scanned_at = time.time()
+        self._state["signals"] = {}  # never let Job 3 reuse a previous scan if this one fails
         if not token_matrix:
             logger.warning(f"[JOB2:{self.icao}] No token matrix — skipping scan. Run Job 1 first.")
             return
@@ -207,11 +214,20 @@ class CityRunner:
             edge_threshold     = self.edge_threshold,
             max_edge_magnitude = self.max_edge_magnitude,
         )
+        date = self._state.get("market_date", self._local_now().strftime("%Y-%m-%d"))
+        scan_id = self.ledger.log_scan(
+            self.icao, datetime.datetime.utcfromtimestamp(scanned_at).isoformat(), date,
+            forecast, trailing_bias, model_probs,
+        )
+        for sig in signals.values():
+            sig.market_date, sig.scanned_at, sig.scan_id = date, scanned_at, scan_id
+            if sig.market_price and (sig.market_price.bids or sig.market_price.asks):  # Gamma prices carry no book
+                p = sig.market_price
+                self.ledger.log_book(scan_id, p.token_id, "scan", p.bids, p.asks, p.fetched_at)
         self._state["signals"] = signals
 
         # Log ALL signals to DB — including non-actionable, gated, and held —
         # so the dashboard can show the full scan picture.
-        date = self._state.get("market_date", self._local_now().strftime("%Y-%m-%d"))
         for label, sig in signals.items():
             mid = sig.market_price.mid_price if sig.market_price else 0.0
             self.ledger.log_signal(
@@ -222,6 +238,7 @@ class CityRunner:
                 edge          = sig.edge,
                 action        = sig.action_label,
                 icao          = self.icao,
+                scan_id       = scan_id,
             )
 
         buys  = [l for l, s in signals.items() if s.direction == "BUY"  and s.actionable]

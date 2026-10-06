@@ -42,12 +42,45 @@ from py_clob_client_v2.order_builder.constants import BUY as _CLOB_BUY
 from py_clob_client_v2.constants import POLYGON
 
 from db.ledger import Ledger
-from core.edge import EdgeSignal
+from core.edge import EdgeSignal, book_levels
 from core.sizing import SizingResult
 
 logger = logging.getLogger("hermes.execution")
 
 VWAP_DRIFT_TOLERANCE = 0.03   # Abort if book moves > 3% between compute and exec
+
+# ── Information integrity gate (P3) ───────────────────────────────────────────
+# Per input type: (fresh up to, degraded up to) seconds of age. Older is STALE;
+# a missing or future timestamp (clock mismatch) is INVALID. Entries proceed on
+# FRESH/DEGRADED and are refused on STALE/INVALID. The scan age bounds the
+# forecast and scan-time books too, since Job 2 fetches them in that scan;
+# execution re-fetches the book itself before ordering.
+SIGNAL_MAX_AGE_SECONDS = 15 * 60  # one Job 2 cycle
+FRESH, DEGRADED, STALE, INVALID = "FRESH", "DEGRADED", "STALE", "INVALID"
+FRESHNESS_POLICY = {"scan": (SIGNAL_MAX_AGE_SECONDS, SIGNAL_MAX_AGE_SECONDS)}
+_STATE_RANK = {FRESH: 0, DEGRADED: 1, STALE: 2, INVALID: 3}
+
+
+def freshness(kind: str, at: Optional[float], now: Optional[float] = None) -> str:
+    if at is None:
+        return INVALID
+    age = (time.time() if now is None else now) - at
+    fresh_s, degraded_s = FRESHNESS_POLICY[kind]
+    if age < 0:
+        return INVALID
+    return FRESH if age <= fresh_s else DEGRADED if age <= degraded_s else STALE
+
+
+def signal_freshness(signal: EdgeSignal, market_date: str, now: Optional[float] = None) -> str:
+    """Worst freshness state across every input the signal was built from."""
+    if not market_date or getattr(signal, "market_date", None) != market_date:
+        return INVALID
+    states = [freshness("scan", getattr(signal, "scanned_at", None), now)]
+    return max(states, key=_STATE_RANK.__getitem__)
+
+
+def signal_is_current(signal: EdgeSignal, market_date: str) -> bool:
+    return signal_freshness(signal, market_date) in (FRESH, DEGRADED)
 
 # Signal-staleness check: Job 2 computes an edge signal against a price
 # snapshot, then Job 3 executes ~2 min later (by cron offset — can be more
@@ -357,6 +390,11 @@ class ExecutionEngine:
         label     = signal.bracket_label
         direction = signal.direction  # "BUY" or "SELL"
 
+        state = signal_freshness(signal, market_date)
+        if state not in (FRESH, DEGRADED):
+            logger.warning(f"[EXEC] {label}: signal {state} (stale scan or market-date mismatch) — abort")
+            return False
+
         if direction not in ("BUY", "SELL"):
             logger.error(f"[EXEC] {label}: unknown direction '{direction}' — abort")
             return False
@@ -437,6 +475,9 @@ class ExecutionEngine:
 
         # ── PM-4: Pre-execution VWAP revalidation ─────────────────────────────
         book_2 = self.client.get_order_book(exec_token_id)
+        # The book this order is decided on, for replay.
+        self.ledger.log_book(getattr(signal, "scan_id", None), exec_token_id, "exec",
+                             book_levels(book_2, "bids"), book_levels(book_2, "asks"))
 
         if _is_ghost_book(book_2):
             logger.error(
@@ -468,6 +509,10 @@ class ExecutionEngine:
         # real order placement entirely. Book fetch + revalidation + drift
         # check above already happened against LIVE prices, so this is a
         # realistic fill, not a fabricated one — only the order write is skipped.
+        if not signal_is_current(signal, market_date):
+            logger.warning(f"[EXEC] {label}: signal expired before order — abort")
+            return False
+
         if self.paper_trading:
             position_label = f"{label}:{'YES' if direction == 'BUY' else 'NO'}"
             self.ledger.record_position(
@@ -478,6 +523,7 @@ class ExecutionEngine:
                 size_usd    = sizing.size_usd,
                 market_date = market_date,
                 is_paper    = True,
+                scan_id     = getattr(signal, "scan_id", None),
             )
             return True
 
@@ -555,6 +601,7 @@ class ExecutionEngine:
                 entry_price = vwap_exec,
                 size_usd    = sizing.size_usd,
                 market_date = market_date,
+                scan_id     = getattr(signal, "scan_id", None),
             )
             return True
 

@@ -38,6 +38,7 @@ original naked-short bug this tool exists to validate the fix for.
 """
 
 import sys
+import time
 import argparse
 from types import SimpleNamespace
 
@@ -135,11 +136,17 @@ def main():
     # ExecutionEngine.execute() only reads bracket_label/direction/token_id/
     # no_token_id off the signal — a SimpleNamespace avoids fighting
     # EdgeSignal's own auto-computed direction/actionable gating logic.
+    # Stamped as scanned now for args.date: an operator-confirmed order is a
+    # fresh decision, so it passes execute()'s freshness gate. No market_price
+    # skips the signal-vs-book staleness check (there's no scan to compare to).
     signal = SimpleNamespace(
         bracket_label=bracket,
         direction=direction,
         token_id=yes_id,
         no_token_id=no_id or None,
+        market_price=None,
+        market_date=args.date,
+        scanned_at=time.time(),
     )
     sizing = SizingResult(
         verdict="EXECUTE",

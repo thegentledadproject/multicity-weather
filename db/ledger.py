@@ -5,8 +5,11 @@ Tables:
   open_positions    : live bracket entries, keyed by token_id
   signal_log        : every edge scan result, win/loss after settle
   token_matrix      : today's bracket → token_id mapping (refreshed daily)
+  scan_snapshots    : append-only inputs of each Job 2 scan (forecast, bias, probs)
+  book_snapshots    : append-only full order books seen at scan and at execution
 """
 
+import json
 import sqlite3
 import datetime
 import logging
@@ -113,6 +116,34 @@ class Ledger:
                     closed_at       TEXT    NOT NULL,
                     is_paper        INTEGER NOT NULL DEFAULT 0
                 );
+
+                -- Point-in-time record: never UPDATEd, so "what did the engine
+                -- know at T" is the latest row with scan_at <= T.
+                CREATE TABLE IF NOT EXISTS scan_snapshots (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    icao_code        TEXT    NOT NULL,
+                    scan_at          TEXT    NOT NULL,
+                    market_date      TEXT    NOT NULL,
+                    forecast_source  TEXT    NOT NULL,
+                    mu               REAL    NOT NULL,
+                    sigma            REAL    NOT NULL,
+                    mu_gfs           REAL,
+                    mu_ecmwf         REAL,
+                    sigma_gfs        REAL,
+                    sigma_ecmwf      REAL,
+                    trailing_bias    REAL    NOT NULL,
+                    model_probs      TEXT    NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS book_snapshots (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scan_id     INTEGER,
+                    fetched_at  TEXT    NOT NULL,
+                    token_id    TEXT    NOT NULL,
+                    purpose     TEXT    NOT NULL,
+                    bids        TEXT    NOT NULL,
+                    asks        TEXT    NOT NULL
+                );
             """)
             conn.commit()
 
@@ -149,6 +180,14 @@ class Ledger:
                 if "is_paper" not in cols:
                     logger.info(f"[LEDGER] Migrating: adding is_paper to {table}")
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN is_paper INTEGER NOT NULL DEFAULT 0")
+
+            # scan_id: links signals, positions and exits to the scan_snapshots
+            # row (and its books) that produced them.
+            for table in ("signal_log", "open_positions", "exit_log"):
+                cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})")]
+                if "scan_id" not in cols:
+                    logger.info(f"[LEDGER] Migrating: adding scan_id to {table}")
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN scan_id INTEGER")
 
             # token_matrix: pre-multi-city DBs have bracket_label as sole PRIMARY
             # KEY, which collides once a second city trades an overlapping
@@ -187,6 +226,10 @@ class Ledger:
                     ON exit_log(market_date);
                 CREATE INDEX IF NOT EXISTS idx_exit_icao_date
                     ON exit_log(icao_code, market_date);
+                CREATE INDEX IF NOT EXISTS idx_scan_icao_date_at
+                    ON scan_snapshots(icao_code, market_date, scan_at);
+                CREATE INDEX IF NOT EXISTS idx_book_scan
+                    ON book_snapshots(scan_id);
             """)
 
     # ── Calibration ───────────────────────────────────────────────────────────
@@ -302,7 +345,7 @@ class Ledger:
     def record_position(
         self, token_id: str, label: str, icao: str,
         entry_price: float, size_usd: float, market_date: str = "",
-        is_paper: bool = False,
+        is_paper: bool = False, scan_id: Optional[int] = None,
     ):
         """
         market_date: SGT calendar date this position was opened under.
@@ -329,10 +372,10 @@ class Ledger:
             conn.execute(
                 "INSERT OR REPLACE INTO open_positions "
                 "(token_id, bracket_label, icao_code, entry_price, size_usd, "
-                " opened_at, peak_price, market_date, is_paper) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " opened_at, peak_price, market_date, is_paper, scan_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (token_id, label, icao.upper(), entry_price, size_usd, ts,
-                 entry_price, market_date, int(is_paper)),
+                 entry_price, market_date, int(is_paper), scan_id),
             )
         logger.info(
             f"[LEDGER] {'PAPER ' if is_paper else ''}Position open: {label} @ {entry_price:.4f} "
@@ -422,7 +465,7 @@ class Ledger:
         self, date: str, bracket_label: str,
         model_prob: float, market_price: float,
         edge: float, action: str, gate_reason: str = "",
-        icao: str = "WSSS",
+        icao: str = "WSSS", scan_id: Optional[int] = None,
     ):
         """
         gate_reason: previously a schema column that existed but was never
@@ -436,9 +479,9 @@ class Ledger:
         with self._conn() as conn:
             conn.execute(
                 "INSERT INTO signal_log "
-                "(timestamp, date, icao_code, bracket_label, model_prob, market_price, edge, action, gate_reason) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (ts, date, icao.upper(), bracket_label, model_prob, market_price, edge, action, gate_reason),
+                "(timestamp, date, icao_code, bracket_label, model_prob, market_price, edge, action, gate_reason, scan_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (ts, date, icao.upper(), bracket_label, model_prob, market_price, edge, action, gate_reason, scan_id),
             )
 
     def mark_signal_settled(self, date: str, bracket_label: str, outcome: str, icao: str = "WSSS"):
@@ -448,6 +491,55 @@ class Ledger:
                 "WHERE date = ? AND bracket_label = ? AND icao_code = ? AND settled_outcome IS NULL",
                 (outcome, date, bracket_label, icao.upper()),
             )
+
+    # ── Point-in-time snapshots ───────────────────────────────────────────────
+
+    def log_scan(self, icao: str, scan_at: str, market_date: str, forecast,
+                 trailing_bias: float, model_probs: Dict[str, float]) -> int:
+        """Record every input Job 2 used; returns the scan_id that signals, books and trades cite."""
+        with self._conn() as conn:
+            return conn.execute(
+                "INSERT INTO scan_snapshots (icao_code, scan_at, market_date, forecast_source, mu, sigma, "
+                "mu_gfs, mu_ecmwf, sigma_gfs, sigma_ecmwf, trailing_bias, model_probs) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (icao.upper(), scan_at, market_date, forecast.source, forecast.mu, forecast.sigma,
+                 forecast.mu_gfs, forecast.mu_ecmwf, forecast.sigma_gfs, forecast.sigma_ecmwf,
+                 trailing_bias, json.dumps(model_probs, sort_keys=True)),
+            ).lastrowid
+
+    def log_book(self, scan_id: Optional[int], token_id: str, purpose: str,
+                 bids: List[Tuple[float, float]], asks: List[Tuple[float, float]],
+                 fetched_at: Optional[str] = None):
+        """Full-depth book as [[price, size], ...]; purpose is 'scan' or 'exec'."""
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO book_snapshots (scan_id, fetched_at, token_id, purpose, bids, asks) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (scan_id, fetched_at or datetime.datetime.utcnow().isoformat(), token_id,
+                 purpose, json.dumps(bids), json.dumps(asks)),
+            )
+
+    def scan_as_of(self, icao: str, market_date: str, at: str) -> Optional[dict]:
+        """
+        What the engine knew for this city's market_date at UTC ISO time `at`:
+        the latest scan at or before it, with the books it saw. None if no scan yet.
+        """
+        with self._conn() as conn:
+            scan = conn.execute(
+                "SELECT * FROM scan_snapshots WHERE icao_code = ? AND market_date = ? AND scan_at <= ? "
+                "ORDER BY scan_at DESC, id DESC LIMIT 1",
+                (icao.upper(), market_date, at),
+            ).fetchone()
+            if scan is None:
+                return None
+            books = conn.execute(
+                "SELECT * FROM book_snapshots WHERE scan_id = ? AND fetched_at <= ? ORDER BY id",
+                (scan["id"], at),
+            ).fetchall()
+        result = dict(scan)
+        result["model_probs"] = json.loads(result["model_probs"])
+        result["books"] = [dict(b, bids=json.loads(b["bids"]), asks=json.loads(b["asks"])) for b in books]
+        return result
 
     # ── Exit log ──────────────────────────────────────────────────────────────
 
@@ -465,6 +557,7 @@ class Ledger:
         market_date:  str = "",
         icao:         str = "WSSS",
         is_paper:     bool = False,
+        scan_id:      Optional[int] = None,
     ):
         """
         Record a completed position exit with P&L.
@@ -490,10 +583,10 @@ class Ledger:
             conn.execute(
                 "INSERT INTO exit_log "
                 "(timestamp, market_date, icao_code, token_id, bracket_label, direction, reason, "
-                " entry_price, exit_price, size_usd, realised_pnl, opened_at, closed_at, is_paper) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " entry_price, exit_price, size_usd, realised_pnl, opened_at, closed_at, is_paper, scan_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (ts, market_date, icao.upper(), token_id, bracket_label, direction, reason,
-                 entry_price, exit_price, size_usd, realised_pnl, opened_at, ts, int(is_paper)),
+                 entry_price, exit_price, size_usd, realised_pnl, opened_at, ts, int(is_paper), scan_id),
             )
         pnl_pct = (realised_pnl / size_usd * 100) if size_usd else 0.0
         logger.info(
