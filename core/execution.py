@@ -31,6 +31,7 @@ They are called from APScheduler jobs running in a thread pool.
 """
 
 import logging
+import math
 import os
 import time
 import datetime
@@ -43,7 +44,8 @@ from py_clob_client_v2.constants import POLYGON
 
 from db.ledger import Ledger
 from core.edge import EdgeSignal, book_levels
-from core.sizing import SizingResult
+from core.sizing import SizingResult, TAKER_FEE_RATE
+from core.execution_curve import EXEC_BUFFER
 
 logger = logging.getLogger("hermes.execution")
 
@@ -346,6 +348,19 @@ def _parse_fill_status(response: Any, label: str) -> bool:
     return False
 
 
+def _fill_amounts(response: Any):
+    """(USD spent, shares received) from a BUY fill (makingAmount/takingAmount), or (None, None)."""
+    get = response.get if isinstance(response, dict) else (lambda k: getattr(response, k, None))
+    try:
+        spent, shares = float(get("makingAmount")), float(get("takingAmount"))
+    except (TypeError, ValueError):
+        return None, None
+    # A BUY pays < $1 per share, so spent must be positive and below shares.
+    if not (math.isfinite(spent) and math.isfinite(shares) and 0 < spent < shares):
+        return None, None
+    return spent, shares
+
+
 class ExecutionEngine:
     def __init__(
         self, client: ClobClient, ledger: Ledger, vault_usd: float, icao: str = "WSSS",
@@ -410,6 +425,12 @@ class ExecutionEngine:
 
         if self.ledger.is_position_open(exec_token_id):
             logger.info(f"[EXEC] {label}: position already open — skip")
+            return False
+
+        # An earlier order on this token timed out or crashed mid-flight and may
+        # have filled; buying again could double the position. Reconcile first.
+        if self.ledger.unresolved_orders(token_id=exec_token_id):
+            logger.error(f"[EXEC] {label}: unreconciled earlier order on this token — abort")
             return False
 
         # ── Re-entry cooldown ────────────────────────────────────────────────
@@ -500,6 +521,18 @@ class ExecutionEngine:
             )
             return False
 
+        # -- Model recheck at the price this order will actually pay ----------
+        # The scan priced the edge against the mid up to a cycle ago; it must
+        # still clear the threshold after walking the current book plus fees.
+        model_prob = getattr(signal, "model_prob", None)
+        if model_prob is not None:  # manual_trigger orders carry no model view
+            win_prob = model_prob if direction == "BUY" else 1.0 - model_prob
+            exec_edge = win_prob - vwap_exec * (1 + TAKER_FEE_RATE) - EXEC_BUFFER
+            if exec_edge < signal.edge_threshold:
+                logger.warning(f"[EXEC] {label} {direction}: executable edge {exec_edge:.4f} at "
+                               f"VWAP {vwap_exec:.4f} < {signal.edge_threshold:.2f} — abort")
+                return False
+
         logger.info(
             f"[EXEC] {'📝 PAPER ' if self.paper_trading else '🔥 '}{direction} {label} | VWAP={vwap_exec:.4f} | "
             f"${sizing.size_usd:.2f} | net EV={sizing.net_ev*100:+.2f}%"
@@ -513,7 +546,11 @@ class ExecutionEngine:
             logger.warning(f"[EXEC] {label}: signal expired before order — abort")
             return False
 
+        order = dict(icao=self.icao, market_date=market_date, token_id=exec_token_id, bracket=label,
+                     direction=direction, scan_id=getattr(signal, "scan_id", None),
+                     amount_usd=round(sizing.size_usd, 2), expected_vwap=vwap_exec)
         if self.paper_trading:
+            self.ledger.open_order(**order, limit_price=None, state="PAPER_FILLED", is_paper=True)
             position_label = f"{label}:{'YES' if direction == 'BUY' else 'NO'}"
             self.ledger.record_position(
                 token_id    = exec_token_id,
@@ -588,23 +625,43 @@ class ExecutionEngine:
             logger.warning(f"[EXEC] {label}: pre-order balance/allowance sync failed: {e}")
 
         # ── Post order — FOK: fill entirely at/inside limit, or reject ────────
-        response = self.client.post_order(signed_order, OrderType.FOK)
+        # FOK means there are no partial fills to manage: all or nothing.
+        # The order is logged SUBMITTED first; if posting raises (timeout,
+        # dropped connection) its outcome is UNKNOWN (it may have filled), so
+        # this token is blocked until someone reconciles it, never re-sent.
+        cid = self.ledger.open_order(**order, limit_price=limit_price)
+        try:
+            response = self.client.post_order(signed_order, OrderType.FOK)
+        except Exception as e:
+            self.ledger.update_order(cid, "UNKNOWN", response=repr(e))
+            logger.critical(f"[EXEC] {label} {direction}: post_order raised {e!r} — order {cid} state "
+                            f"UNKNOWN; entries on this token blocked until reconciled")
+            return False
 
         # ── Parse fill and record ──────────────────────────────────────────────
         if _parse_fill_status(response, label):
+            spent, shares = _fill_amounts(response)
+            state = "FILLED"
+            if spent is None:
+                # Filled, but the response lacks usable amounts: record the
+                # validated quote so the position is still managed, and flag it.
+                spent, shares, state = sizing.size_usd, sizing.size_usd / vwap_exec, "FILLED_ESTIMATED"
+                logger.error(f"[EXEC] {label}: fill confirmed without amounts — recorded at quoted VWAP")
+            self.ledger.update_order(cid, state, spent, shares, response=str(response))
             # Store direction in label suffix so DB distinguishes YES/NO positions
             position_label = f"{label}:{'YES' if direction == 'BUY' else 'NO'}"
             self.ledger.record_position(
                 token_id    = exec_token_id,
                 label       = position_label,
                 icao        = self.icao,
-                entry_price = vwap_exec,
-                size_usd    = sizing.size_usd,
+                entry_price = spent / shares,
+                size_usd    = spent,
                 market_date = market_date,
                 scan_id     = getattr(signal, "scan_id", None),
             )
             return True
 
+        self.ledger.update_order(cid, "REJECTED", response=str(response))
         logger.warning(
             f"[EXEC] {label} {direction}: FOK rejected — no position recorded. "
             f"Raw: {response}"

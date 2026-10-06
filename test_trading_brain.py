@@ -93,12 +93,62 @@ def p8_decision_engine(ledger):
     assert [(r[0], r[1]) for r in rows] == [("31°C", "ENTER"), ("32°C", "HOLD")] and "RISK_CAPACITY" in rows[1][2]
 
 
+def p9_order_lifecycle(ledger):
+    from core.execution import ExecutionEngine
+    from core.sizing import SizingResult
+
+    def client(ask=0.41, response=None, raises=None):
+        c = Mock()
+        c.get_order_book.return_value = {"bids": [{"price": str(ask - 0.02), "size": "1000"}],
+                                         "asks": [{"price": str(ask), "size": "1000"}]}
+        c.get_balance_allowance.return_value = {"balance": "1000"}
+        c.post_order.side_effect = raises
+        c.post_order.return_value = response
+        return c
+
+    def fresh(token="yes"):
+        sig = signal()
+        sig.token_id = token
+        sig.market_date, sig.scanned_at, sig.scan_id = DAY, time.time(), 1
+        return sig
+
+    sizing = SizingResult("EXECUTE", "BUY", 10.0, 0.1, 0.1, 0.1, "test")
+    def states():
+        with ledger._conn() as conn:
+            return [r["state"] for r in conn.execute("SELECT state FROM order_log ORDER BY id")]
+    # API timeout: outcome unknown, no position, and the token is blocked from a resend.
+    c = client(raises=TimeoutError("read timed out"))
+    assert not ExecutionEngine(c, ledger, 100, "WSSS").execute(fresh(), sizing, DAY)
+    assert not ledger.get_open_positions() and states() == ["UNKNOWN"]
+    assert not ExecutionEngine(c, ledger, 100, "WSSS").execute(fresh(), sizing, DAY)
+    assert c.post_order.call_count == 1 and len(ledger.unresolved_orders("WSSS")) == 1
+    # Rejection.
+    assert not ExecutionEngine(client(response={"status": "unmatched", "success": False}),
+                               ledger, 100, "WSSS").execute(fresh("t2"), sizing, DAY)
+    # Fill with amounts: the position uses what was actually paid and received.
+    filled = {"status": "matched", "success": True, "makingAmount": "9.9", "takingAmount": "24.0"}
+    assert ExecutionEngine(client(response=filled), ledger, 100, "WSSS").execute(fresh("t3"), sizing, DAY)
+    pos = next(p for p in ledger.get_open_positions() if p["token_id"] == "t3")
+    assert pos["size_usd"] == 9.9 and abs(pos["entry_price"] - 9.9 / 24) < 1e-12
+    # Fill confirmed without amounts: managed at the quote, flagged.
+    no_amounts = {"status": "matched", "success": True, "size_matched": "24"}
+    assert ExecutionEngine(client(response=no_amounts), ledger, 100, "WSSS").execute(fresh("t4"), sizing, DAY)
+    # Price moved: ask 0.55 is inside the staleness tolerance, but the edge is gone at that price.
+    moved = client(ask=0.55, response=filled)
+    assert not ExecutionEngine(moved, ledger, 100, "WSSS").execute(fresh("t5"), sizing, DAY)
+    moved.post_order.assert_not_called()
+    # Paper fills are recorded too.
+    assert ExecutionEngine(client(), ledger, 100, "WSSS", paper_trading=True).execute(fresh("t6"), sizing, DAY)
+    assert states() == ["UNKNOWN", "REJECTED", "FILLED", "FILLED_ESTIMATED", "PAPER_FILLED"]
+
+
 def main():
     logging.basicConfig(level=logging.CRITICAL)
     with tempfile.TemporaryDirectory() as temp:
         p5_edge_lifecycle(Ledger(os.path.join(temp, "p5.db")))
         p8_decision_engine(Ledger(os.path.join(temp, "p8.db")))
-    print("Trading-brain checks passed: P5, P8")
+        p9_order_lifecycle(Ledger(os.path.join(temp, "p9.db")))
+    print("Trading-brain checks passed: P5, P8, P9")
 
 
 if __name__ == "__main__":
