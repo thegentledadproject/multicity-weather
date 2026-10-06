@@ -37,9 +37,10 @@ and gated from execution rather than sized and traded, even though it would
 otherwise look like the best signal on the board.
 """
 
+import datetime
 import logging
 import requests
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger("hermes.edge")
 
@@ -67,6 +68,10 @@ class MarketPrice:
         self.best_ask      = best_ask
         self.spread        = spread       # ask - bid
         self.liquidity_usd = liquidity_usd  # estimated from top-of-book
+        # Full depth + UTC fetch time, for book_snapshots; empty for Gamma prices.
+        self.bids: list = []
+        self.asks: list = []
+        self.fetched_at = ""
 
     def __repr__(self):
         return (
@@ -152,6 +157,13 @@ class EdgeSignal:
         )
 
 
+def book_levels(book, side: str) -> List[Tuple[float, float]]:
+    """[(price, size), ...] for one side of a REST dict or SDK order book."""
+    raw = book.get(side, []) if isinstance(book, dict) else getattr(book, side, None) or []
+    return [(float(x["price"]), float(x["size"])) if isinstance(x, dict)
+            else (float(x.price), float(x.size)) for x in raw]
+
+
 def fetch_market_price(token_id: str, timeout: int = 10) -> Optional[MarketPrice]:
     """
     Fetch live order book from Polymarket CLOB and extract:
@@ -219,7 +231,7 @@ def fetch_market_price(token_id: str, timeout: int = 10) -> Optional[MarketPrice
         bid_liq_usd  = sum(float(b["price"]) * float(b["size"]) for b in top_bids)
         liquidity_usd = min(ask_liq_usd, bid_liq_usd)
 
-        return MarketPrice(
+        price = MarketPrice(
             token_id      = token_id,
             mid_price     = round(mid_price, 5),
             best_bid      = round(best_bid, 5),
@@ -227,6 +239,9 @@ def fetch_market_price(token_id: str, timeout: int = 10) -> Optional[MarketPrice
             spread        = round(spread, 5),
             liquidity_usd = round(liquidity_usd, 2),
         )
+        price.bids, price.asks = book_levels(book, "bids"), book_levels(book, "asks")
+        price.fetched_at = datetime.datetime.utcnow().isoformat()
+        return price
 
     except Exception as e:
         logger.warning(f"[EDGE] CLOB book fetch failed for {token_id[:12]}: {e}")

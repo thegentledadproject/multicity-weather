@@ -52,6 +52,9 @@ class CityConfig:
     hard_prior_mu:       float                       # fallback forecast mean if all upstream fails
     hard_prior_sigma:    float
     official_station_fetcher: Optional[Callable[[str, int], Optional[float]]] = None
+    # Station name exactly as the Polymarket rules text names it — the
+    # settlement gate (core/discovery.py) refuses events that don't.
+    settlement_station:  str = ""
     # When True, core/execution.py and core/position_monitor.py still fetch
     # live order books (for realistic fill prices) but skip real order
     # placement entirely — no CLOB order is ever created or posted, so no
@@ -183,6 +186,20 @@ def _wsss_official_fetcher(date: str, timeout: int = 15) -> Optional[float]:
     return fetch_nea_changi(date, timeout)
 
 
+def _bracket_range(low: int, high: int) -> Dict[str, Tuple[float, float]]:
+    """"{low}°C or below", one-degree buckets, then "{high}°C or higher"."""
+    bounds = {f"{t}°C": (float(t), float(t + 1)) for t in range(low, high + 1)}
+    bounds[f"{low}°C"] = (float("-inf"), float(low + 1))
+    bounds[f"{high}°C"] = (float(high), float("inf"))
+    return bounds
+
+
+# Live for both cities as of 2026-10-07 ("28°C or below" ... "38°C or higher"),
+# up from July's 26-36. Ranges move with the season; core/discovery.py's
+# settlement gate blocks a city whose live event no longer matches this.
+_BRACKETS_28_38 = _bracket_range(28, 38)
+
+
 CITIES: Dict[str, CityConfig] = {
     "WSSS": CityConfig(
         icao="WSSS",
@@ -196,20 +213,8 @@ CITIES: Dict[str, CityConfig] = {
         # WSSS event lists 26°C through 36°C, not just the 29-33°C middle
         # band this config used to define. Tails are open-ended catch-alls
         # ("26°C or below" / "36°C or above"), not narrow 1-degree bins.
-        bracket_labels=["26°C", "27°C", "28°C", "29°C", "30°C", "31°C", "32°C", "33°C", "34°C", "35°C", "36°C"],
-        bracket_bounds={
-            "26°C": (float("-inf"), 27.0),
-            "27°C": (27.0, 28.0),
-            "28°C": (28.0, 29.0),
-            "29°C": (29.0, 30.0),
-            "30°C": (30.0, 31.0),
-            "31°C": (31.0, 32.0),
-            "32°C": (32.0, 33.0),
-            "33°C": (33.0, 34.0),
-            "34°C": (34.0, 35.0),
-            "35°C": (35.0, 36.0),
-            "36°C": (36.0, float("inf")),
-        },
+        bracket_labels=list(_BRACKETS_28_38),
+        bracket_bounds=_BRACKETS_28_38,
         # Negative = left skew (colder tail heavier). SW monsoon months
         # (May-Sep): stronger left skew. Moved verbatim from core/model.py's
         # old SKEW_ALPHA_TABLE[("WSSS", month)].
@@ -228,6 +233,7 @@ CITIES: Dict[str, CityConfig] = {
         hard_prior_mu=31.5,
         hard_prior_sigma=1.0,
         official_station_fetcher=_wsss_official_fetcher,
+        settlement_station="Singapore Changi Airport",
         # Paper trading, same as WMKK (see CityConfig.paper_trading) — its
         # bracket range/settlement source were both corrected this session
         # (5->11 brackets, ASOS/METAR settlement), so re-validate against
@@ -252,20 +258,8 @@ CITIES: Dict[str, CityConfig] = {
         # average climate. An earlier pass here guessed a +1°C shift
         # (27-37°C); that was wrong and has been corrected. Tails are
         # open-ended catch-alls, same as WSSS.
-        bracket_labels=["26°C", "27°C", "28°C", "29°C", "30°C", "31°C", "32°C", "33°C", "34°C", "35°C", "36°C"],
-        bracket_bounds={
-            "26°C": (float("-inf"), 27.0),
-            "27°C": (27.0, 28.0),
-            "28°C": (28.0, 29.0),
-            "29°C": (29.0, 30.0),
-            "30°C": (30.0, 31.0),
-            "31°C": (31.0, 32.0),
-            "32°C": (32.0, 33.0),
-            "33°C": (33.0, 34.0),
-            "34°C": (34.0, 35.0),
-            "35°C": (35.0, 36.0),
-            "36°C": (36.0, float("inf")),
-        },
+        bracket_labels=list(_BRACKETS_28_38),
+        bracket_bounds=_BRACKETS_28_38,
         # KL's NE monsoon (wet season, Nov-Mar) is milder than Singapore's SW
         # monsoon skew; dry inter-monsoon months (Jun-Sep, haze-prone) trend
         # hotter with a heavier left tail. Estimated, not yet calibrated
@@ -288,6 +282,7 @@ CITIES: Dict[str, CityConfig] = {
         # No Malaysian government equivalent of NEA's data.gov.sg API is
         # wired, so this is the only official-station source for WMKK.
         official_station_fetcher=functools.partial(fetch_asos_daily_max, "WMKK", "Asia/Kuala_Lumpur"),
+        settlement_station="Kuala Lumpur Intl Airport",
         # WMKK is new/unproven (bracket ranges and skew table only recently
         # verified, no live trading history) — paper trading first to prove
         # the full pipeline against real market prices before risking capital.

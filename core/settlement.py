@@ -38,6 +38,7 @@ the early hours of the next):
 import json
 import logging
 import datetime
+import pytz
 import requests
 from typing import Dict, Optional
 from urllib.parse import quote
@@ -112,7 +113,13 @@ class SettlementEngine:
         #      which means Job 2 never ran that day (e.g. discovery found no
         #      token matrix). Logging a residual against a hard prior is
         #      meaningless and corrupts fetch_trailing_bias() for every future day.
-        if self.ledger.has_calibration_for_date(self.icao, market_date):
+        local_today = datetime.datetime.now(pytz.timezone(self.city_config.timezone)).date().isoformat()
+        if market_date >= local_today:
+            # The station feed only has the high SO FAR; logging it would lock
+            # a partial-day max into calibration (has_calibration_for_date
+            # then blocks the correction). Settle once the local day is over.
+            logger.info(f"[SETTLE] {self.icao}: {market_date} not over yet — calibration deferred.")
+        elif self.ledger.has_calibration_for_date(self.icao, market_date):
             logger.info(
                 f"[SETTLE] {self.icao}: calibration already logged for {market_date} — skipping Task B."
             )
@@ -218,7 +225,11 @@ class SettlementEngine:
             try:
                 actual = self.city_config.official_station_fetcher(date, self.timeout)
                 if actual is not None:
-                    return actual
+                    # METARs report whole °C (ASOS's °F is a conversion of that),
+                    # and the model prices bracket "X°C" as [X, X+1) — so a
+                    # reported X sits at X+0.5 in model space on average.
+                    # Logging the bare integer biases every forecast 0.5°C low.
+                    return round(actual) + 0.5
             except Exception as e:
                 logger.error(f"[SETTLE] {self.icao}: official station fetch failed: {e}")
 
