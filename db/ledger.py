@@ -256,6 +256,14 @@ class Ledger:
                     DROP TABLE token_matrix_old;
                 """)
 
+            # scan_snapshots created by the single-city wsss-weatherbot (its M1
+            # truth layer) has no icao_code, and CREATE TABLE IF NOT EXISTS keeps
+            # that schema, so the index below would fail on startup. Its rows
+            # are all Singapore.
+            if "icao_code" not in [r["name"] for r in conn.execute("PRAGMA table_info(scan_snapshots)")]:
+                logger.info("[LEDGER] Migrating: adding icao_code to legacy scan_snapshots")
+                conn.execute("ALTER TABLE scan_snapshots ADD COLUMN icao_code TEXT NOT NULL DEFAULT 'WSSS'")
+
             # Indexes — safe now that market_date/icao_code are guaranteed present.
             conn.executescript("""
                 CREATE INDEX IF NOT EXISTS idx_calib_icao_date
