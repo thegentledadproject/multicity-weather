@@ -185,6 +185,10 @@ def main():
             today = runner._local_now().date().isoformat()
             assert engine.run(31.0, today)["actual_temp"] is None and not fetcher.called
             assert engine.run(31.0, "2026-01-02")["actual_temp"] == 33.5
+        # No station reading → no calibration, and no fallback to another source.
+        with patch.object(WSSS, "official_station_fetcher", Mock(return_value=None)), \
+                patch("core.settlement.requests.get", side_effect=AssertionError("fallback fetch")):
+            assert SettlementEngine(ledger, WSSS)._fetch_actual_temperature("2026-01-03") is None
 
     print("Truth-layer gates passed: settlement, point-in-time snapshots, freshness.")
 

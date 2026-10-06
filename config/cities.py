@@ -151,8 +151,8 @@ def fetch_asos_daily_max(icao: str, timezone: str, date: str, timeout: int = 15)
 # No secondary station source: NEA's data.gov.sg feed reads Changi S24, a
 # different sensor from the WSSS METAR that settles the market, so falling
 # back to it would calibrate against a number the market never resolves on.
-# If ASOS has no reading, core/settlement.py falls through to its Open-Meteo
-# archive fallback (shared by every city).
+# If ASOS has no reading, core/settlement.py writes no calibration row and
+# Job 4 retries next cycle (there is no fallback source for any city).
 
 
 def _bracket_range(low: int, high: int) -> Dict[str, Tuple[float, float]]:

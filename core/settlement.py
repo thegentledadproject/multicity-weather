@@ -12,9 +12,7 @@ the early hours of the next):
   Task A — Resolution detection:
     Poll Gamma API outcomePrices for each open position's token_id.
     Terminal: outcomePrices[0] > 0.99 (YES) or < 0.01 (NO).
-    On terminal state → fetch actual temperature from the Open-Meteo
-    historical archive (or the city's official_station_fetcher override,
-    if configured) → write calibration residual to ledger.
+    On terminal state → close the position and mark the signal settled.
 
   Task B — Actual temperature fetch (separate from resolution):
     Fetches the true observed daily max at the city's coordinates and
@@ -25,14 +23,13 @@ the early hours of the next):
     We do NOT infer actual temp from the bracket midpoint.
     We fetch it directly from a meteorological source.
 
-  Source order (2026-07-12 revision): city_config.official_station_fetcher
-    is now tried FIRST, not last. For WSSS/WMKK this is an ASOS/METAR
-    archive fetch keyed by the city's own ICAO code — confirmed (by
-    cross-checking three live Polymarket resolutions) to match the actual
-    Wunderground-sourced settlement value exactly. Open-Meteo's historical
-    archive (a gridded reanalysis model, not a station observation) is only
-    a fallback for cities without a station fetcher configured, or when the
-    station fetcher has no reading for the date.
+  Source: city_config.official_station_fetcher only — for WSSS/WMKK an
+    ASOS/METAR archive fetch keyed by the city's ICAO code, the same
+    reports the market settles on. There is deliberately no fallback:
+    Open-Meteo's archive (gridded reanalysis) and NEA S24 (another sensor)
+    are numbers the market never resolves on, so calibrating against them
+    corrupts the trailing bias. No reading → no calibration row this
+    cycle; Job 4 retries every 15 minutes.
 """
 
 import json
@@ -41,20 +38,12 @@ import datetime
 import pytz
 import requests
 from typing import Dict, Optional
-from urllib.parse import quote
 
 from db.ledger import Ledger
 
 logger = logging.getLogger("hermes.settlement")
 
 GAMMA_MARKETS_URL   = "https://gamma-api.polymarket.com/markets"
-OPEN_METEO_HIST_URL = (
-    "https://archive-api.open-meteo.com/v1/archive"
-    "?latitude={lat}&longitude={lon}"
-    "&daily=temperature_2m_max"
-    "&timezone={timezone}"
-    "&start_date={date}&end_date={date}"
-)
 
 
 class SettlementEngine:
@@ -207,52 +196,26 @@ class SettlementEngine:
 
     def _fetch_actual_temperature(self, date: str) -> Optional[float]:
         """
-        Fetch the true observed daily maximum temperature at this city.
-
-        Primary: city_config.official_station_fetcher, if configured (WSSS/WMKK
-        both use an ASOS/METAR archive fetch keyed by ICAO code — confirmed to
-        match Polymarket's actual Wunderground-sourced settlement value exactly,
-        since Wunderground's airport-station pages are themselves METAR-derived).
-        Fallback: Open-Meteo historical archive (gridded reanalysis, not a station
-        observation — used when no station fetcher is configured, or it has no
-        reading for the date).
-
-        This is the critical fix over v4.2's settlement inference:
-        We get the real number, not a bracket midpoint proxy.
+        The city's settlement-station daily max in model space, or None to
+        retry next cycle (no station fetcher, no reading yet, or fetch error).
+        See the module docstring for why there is no fallback source.
         """
-        # ── Primary: city-specific official station (ASOS/METAR, etc.) ───────
-        if self.city_config.official_station_fetcher is not None:
-            try:
-                actual = self.city_config.official_station_fetcher(date, self.timeout)
-                if actual is not None:
-                    # METARs report whole °C (ASOS's °F is a conversion of that),
-                    # and the model prices bracket "X°C" as [X, X+1) — so a
-                    # reported X sits at X+0.5 in model space on average.
-                    # Logging the bare integer biases every forecast 0.5°C low.
-                    return round(actual) + 0.5
-            except Exception as e:
-                logger.error(f"[SETTLE] {self.icao}: official station fetch failed: {e}")
-
-        # ── Fallback: Open-Meteo archive ──────────────────────────────────────
+        fetcher = self.city_config.official_station_fetcher
+        if fetcher is None:
+            logger.warning(f"[SETTLE] {self.icao}: no official_station_fetcher configured — no calibration")
+            return None
         try:
-            url  = OPEN_METEO_HIST_URL.format(
-                lat=self.city_config.lat, lon=self.city_config.lon,
-                timezone=quote(self.city_config.timezone, safe=""), date=date,
-            )
-            resp = requests.get(url, timeout=self.timeout)
-            resp.raise_for_status()
-            data = resp.json()
-
-            t_max_arr = data.get("daily", {}).get("temperature_2m_max", [])
-            if t_max_arr and t_max_arr[0] is not None:
-                actual = float(t_max_arr[0])
-                logger.info(f"[SETTLE] {self.icao}: Open-Meteo archive actual max = {actual:.2f}°C")
-                return actual
-
+            actual = fetcher(date, self.timeout)
         except Exception as e:
-            logger.warning(f"[SETTLE] {self.icao}: Open-Meteo archive failed: {e}")
-
-        return None
+            logger.error(f"[SETTLE] {self.icao}: official station fetch failed: {e}")
+            return None
+        if actual is None:
+            return None
+        # METARs report whole °C (ASOS's °F is a conversion of that), and the
+        # model prices bracket "X°C" as [X, X+1) — so a reported X sits at
+        # X+0.5 in model space on average. Logging the bare integer biases
+        # every forecast 0.5°C low.
+        return round(actual) + 0.5
 
     def find_stuck(self) -> int:
         """
