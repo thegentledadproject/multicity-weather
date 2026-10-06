@@ -7,6 +7,7 @@ Tables:
   token_matrix      : today's bracket → token_id mapping (refreshed daily)
   scan_snapshots    : append-only inputs of each Job 2 scan (forecast, bias, probs)
   book_snapshots    : append-only full order books seen at scan and at execution
+  decision_log      : every entry decision with its full input snapshot (P8)
 """
 
 import json
@@ -133,6 +134,19 @@ class Ledger:
                     sigma_ecmwf      REAL,
                     trailing_bias    REAL    NOT NULL,
                     model_probs      TEXT    NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS decision_log (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    decided_at  TEXT    NOT NULL,
+                    icao_code   TEXT    NOT NULL,
+                    market_date TEXT    NOT NULL,
+                    bracket     TEXT    NOT NULL,
+                    direction   TEXT    NOT NULL,
+                    scan_id     INTEGER,
+                    action      TEXT    NOT NULL,
+                    reasons     TEXT    NOT NULL,
+                    snapshot    TEXT    NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS book_snapshots (
@@ -532,6 +546,17 @@ class Ledger:
                 (scan_id, fetched_at or datetime.datetime.utcnow().isoformat(), token_id,
                  purpose, json.dumps(bids), json.dumps(asks)),
             )
+
+    def log_decision(self, snap: Dict) -> int:
+        """Append a core.decision.snapshot(); returns the decision_log id."""
+        i, d = snap["inputs"], snap["decision"]
+        with self._conn() as conn:
+            return conn.execute(
+                "INSERT INTO decision_log (decided_at, icao_code, market_date, bracket, direction, scan_id, "
+                "action, reasons, snapshot) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (datetime.datetime.utcnow().isoformat(), i["icao"].upper(), i["market_date"], i["bracket"],
+                 i["direction"], i["scan_id"], d["action"], json.dumps(d["reasons"]), json.dumps(snap)),
+            ).lastrowid
 
     def scan_as_of(self, icao: str, market_date: str, at: str) -> Optional[dict]:
         """

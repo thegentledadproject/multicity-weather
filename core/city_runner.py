@@ -47,7 +47,11 @@ from core.model      import BracketModel, fetch_gfs_forecast
 from core.edge       import scan_all_brackets, MAX_EDGE_MAGNITUDE
 from core.edge_state import edge_lifecycle, ACTIONABLE
 from core.sizing     import compute_size, compute_validation_size
-from core.execution  import ExecutionEngine
+from core.execution  import ExecutionEngine, signal_freshness
+from core.decision   import DecisionInputs, ENTER, decide, snapshot
+from core.portfolio  import position_limits
+from core.edge       import book_levels
+from config.cities   import CITIES, resolve_vault_usd
 from core.settlement    import SettlementEngine
 from core.position_monitor import PositionMonitor
 
@@ -60,6 +64,10 @@ logger = logging.getLogger("hermes.city_runner")
 # real rollover (below) can reuse it instead of a fresh fetch — it does
 # NOT make Jobs 2/3/4/5 trade the next day's market early.
 LOOKAHEAD_START_HOUR = int(os.getenv("LOOKAHEAD_START_HOUR", "22"))
+
+
+def _all_vaults_usd() -> float:
+    return sum(resolve_vault_usd(c) for c in CITIES.values())
 
 
 class CityRunner:
@@ -323,20 +331,54 @@ class CityRunner:
                 )
                 logger.info(f"[JOB3:{self.icao}] {label} [{direction}]: {sizing}")
 
-            if sizing.verdict == "EXECUTE":
-                market_date_for_entry = self._state.get(
-                    "market_date", self._local_now().strftime("%Y-%m-%d")
+            market_date_for_entry = self._state.get(
+                "market_date", self._local_now().strftime("%Y-%m-%d")
+            )
+            decision = self._decide(signal, direction, win_prob, sizing, market_date_for_entry)
+            if decision.action != ENTER:
+                logger.info(f"[JOB3:{self.icao}] {decision.action} {label} [{direction}]: "
+                            f"{', '.join(decision.reasons)} (sizing: {sizing.reason})")
+                continue
+            sizing.size_usd = decision.quantities["final"]
+            filled = engine.execute(signal, sizing, market_date=market_date_for_entry)
+            if filled:
+                logger.info(
+                    f"[JOB3:{self.icao}] ✓ Position opened: {label} "
+                    f"{'YES' if direction == 'BUY' else 'NO'} ${sizing.size_usd:.2f} "
+                    f"(expected VWAP {decision.expected['vwap']:.4f})"
                 )
-                filled = engine.execute(signal, sizing, market_date=market_date_for_entry)
-                if filled:
-                    logger.info(
-                        f"[JOB3:{self.icao}] ✓ Position opened: {label} "
-                        f"{'YES' if direction == 'BUY' else 'NO'} ${sizing.size_usd:.2f}"
-                    )
-                else:
-                    logger.warning(f"[JOB3:{self.icao}] ✗ Execution failed or rejected: {label} [{direction}]")
             else:
-                logger.info(f"[JOB3:{self.icao}] Sizing HOLD for {label} [{direction}]: {sizing.reason}")
+                logger.warning(f"[JOB3:{self.icao}] ✗ Execution failed or rejected: {label} [{direction}]")
+
+    def _decide(self, signal, direction, win_prob, sizing, market_date):
+        """Assemble the P8 decision inputs from live state, decide, and log the snapshot."""
+        token = signal.token_id if direction == "BUY" else signal.no_token_id
+        try:
+            asks = book_levels(self.client.get_order_book(token), "asks") if token else []
+        except Exception as e:  # no book → no executable edge, decided and logged as such
+            logger.warning(f"[JOB3:{self.icao}] {signal.bracket_label}: order book fetch failed: {e}")
+            asks = []
+        edge_state = getattr(signal, "edge_state", None)
+        inputs = DecisionInputs(
+            icao=self.icao, market_date=market_date, bracket=signal.bracket_label,
+            direction=direction, scan_id=getattr(signal, "scan_id", None), win_prob=win_prob,
+            edge_threshold=self.edge_threshold,
+            edge_state=edge_state.state if edge_state else "NO_EDGE",
+            freshness=signal_freshness(signal, market_date),
+            settlement_valid=bool(self._state.get("token_matrix")),
+            position_open=bool(token) and self.ledger.is_position_open(token),
+            q_kelly=sizing.size_usd if sizing.verdict == "EXECUTE" else 0.0,
+            limits=position_limits(self.ledger.get_open_positions(), self.icao, market_date,
+                                   signal.bracket_label, direction, self.vault_usd, _all_vaults_usd()),
+            asks=asks, kill_switches=self._kill_switches(),
+        )
+        decision = decide(inputs)
+        self.ledger.log_decision(snapshot(inputs, decision))
+        return decision
+
+    def _kill_switches(self) -> list:
+        """Names of tripped kill switches; any one blocks new entries (P13)."""
+        return []
 
     # ══════════════════════════════════════════════════════════════════════
     # JOB 4 — Settlement Check (every 15 min, 24/7 — checks today AND yesterday)
