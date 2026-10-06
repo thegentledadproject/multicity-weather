@@ -142,13 +142,55 @@ def p9_order_lifecycle(ledger):
     assert states() == ["UNKNOWN", "REJECTED", "FILLED", "FILLED_ESTIMATED", "PAPER_FILLED"]
 
 
+def p10_exits(ledger):
+    from core import position_monitor as pm
+    R = pm.ExitReason
+
+    def exit_for(mid, bid=None, win=None, peak=0.40, **flags):
+        price = MarketPrice("tok", mid, bid if bid is not None else mid - 0.01, mid + 0.01, 0.02, 400)
+        with patch.object(pm, "fetch_market_price", return_value=price):
+            return pm.evaluate_exit("tok", "31°C:YES", 0.40, peak, 0.5, 0.08, 0.2, ledger,
+                                    win_prob=win, **flags).reason
+
+    # Gate P10: every exit family, deterministically. Entry 0.40, threshold 0.08.
+    assert exit_for(0.45, win=0.70) == R.NONE
+    assert exit_for(0.55, peak=0.70, win=0.90) == R.TRAILING_STOP       # 0.55 <= 0.70 * 0.8
+    assert exit_for(0.30, win=0.90) == R.STOP_LOSS                      # <= 0.40 - 0.08
+    assert exit_for(0.50, win=0.35) == R.MODEL_EXIT                     # 0.35 < 0.50 - 0.08
+    assert exit_for(0.55, bid=0.54, win=0.52) == R.SETTLEMENT_EXIT      # bid beats hold value
+    assert exit_for(0.55, bid=0.50, win=0.56) == R.PRICE_EXIT           # converged, in profit
+    assert exit_for(0.45, win=None) == R.NONE                           # no model view: no model exits
+    assert exit_for(0.45, win=0.70, force_time_exit=True) == R.TIME_EXIT
+    assert exit_for(0.45, win=0.70, risk_flatten=True) == R.RISK_EXIT
+    assert exit_for(0.45, win=0.70, info_stale=True) == R.INFORMATION_EXIT
+
+    # Through PositionMonitor.run (paper): a NO position is judged on 1 - P(bracket),
+    # and stops still run when Job 2 has produced no probabilities.
+    client = Mock()
+    client.get_order_book.return_value = {"bids": [{"price": "0.39", "size": "1000"}],
+                                          "asks": [{"price": "0.41", "size": "1000"}]}
+    ledger.record_position("no31", "31°C:NO", "WSSS", 0.40, 10.0, DAY, is_paper=True)
+    monitor = pm.PositionMonitor(client, ledger, 0.08, 0.2, "WSSS", paper_trading=True)
+    price = MarketPrice("no31", 0.40, 0.39, 0.41, 0.02, 400)
+    with patch.object(pm, "fetch_market_price", return_value=price):
+        held = monitor.run({"31°C": 0.30}, market_date=DAY, probs_age_s=60)   # NO wins 70%: hold
+        assert held == [] and ledger.get_open_positions("WSSS")
+        out = monitor.run({"31°C": 0.80}, market_date=DAY, probs_age_s=60)    # NO wins 20%: exit
+    assert [r["reason"] for r in out] == [R.MODEL_EXIT] and not ledger.get_open_positions("WSSS")
+    ledger.record_position("yes32", "32°C:YES", "WSSS", 0.40, 10.0, DAY, is_paper=True)
+    with patch.object(pm, "fetch_market_price", return_value=MarketPrice("yes32", 0.30, 0.29, 0.31, 0.02, 400)):
+        out = monitor.run({}, market_date=DAY, probs_age_s=None)
+    assert [r["reason"] for r in out] == [R.STOP_LOSS]
+
+
 def main():
     logging.basicConfig(level=logging.CRITICAL)
     with tempfile.TemporaryDirectory() as temp:
         p5_edge_lifecycle(Ledger(os.path.join(temp, "p5.db")))
         p8_decision_engine(Ledger(os.path.join(temp, "p8.db")))
         p9_order_lifecycle(Ledger(os.path.join(temp, "p9.db")))
-    print("Trading-brain checks passed: P5, P8, P9")
+        p10_exits(Ledger(os.path.join(temp, "p10.db")))
+    print("Trading-brain checks passed: P5, P8, P9, P10")
 
 
 if __name__ == "__main__":

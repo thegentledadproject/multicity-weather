@@ -215,6 +215,7 @@ class CityRunner:
             return
 
         self._state["model_probs"] = model_probs
+        self._state["probs_at"]    = scanned_at
         self._state["model_mu"]    = forecast.mu
 
         signals = scan_all_brackets(
@@ -376,6 +377,10 @@ class CityRunner:
         self.ledger.log_decision(snapshot(inputs, decision))
         return decision
 
+    def _risk_flatten(self) -> bool:
+        """True when a tripped kill switch requires closing every position (P13)."""
+        return False
+
     def _kill_switches(self) -> list:
         """Names of tripped kill switches; any one blocks new entries (P13)."""
         return []
@@ -434,10 +439,12 @@ class CityRunner:
             logger.info(f"[JOB5:{self.icao}] No open positions.")
             return
 
+        # Stops and the time exit must run even before Job 2 has produced
+        # probabilities (e.g. right after a restart); only model exits need them.
         model_probs = self._state.get("model_probs", {})
+        probs_at = self._state.get("probs_at")
         if not model_probs:
-            logger.warning(f"[JOB5:{self.icao}] No model probs in state — Job 2 may not have run yet.")
-            return
+            logger.warning(f"[JOB5:{self.icao}] No model probs yet — stops/time exits only this cycle.")
 
         monitor = PositionMonitor(
             client         = self.client,
@@ -449,7 +456,11 @@ class CityRunner:
             timezone       = self.config.timezone,
         )
         market_date = self._state.get("market_date", self._local_now().strftime("%Y-%m-%d"))
-        results = monitor.run(model_probs, market_date=market_date)
+        results = monitor.run(
+            model_probs, market_date=market_date,
+            probs_age_s=time.time() - probs_at if probs_at else None,
+            risk_flatten=self._risk_flatten(),
+        )
 
         exits_filled = [r for r in results if r["filled"]]
         exits_failed = [r for r in results if not r["filled"]]
