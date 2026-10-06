@@ -21,6 +21,13 @@ def signal(edge=0.20, model_prob=0.60, mid=0.40):
     return EdgeSignal("31°C", "yes", model_prob, price, edge, 0.08, no_token_id="no")
 
 
+def recent_scan(ledger, icao="WSSS"):
+    """What Job 2 leaves behind; without a recent scan the FORECAST_FEED kill switch blocks entries."""
+    import datetime as dt
+    return ledger.log_scan(icao, dt.datetime.utcnow().isoformat(), DAY,
+                           ForecastResult(31.0, 0.8, "ensemble_blend"), 0.0, {"31°C": 0.6})
+
+
 def p5_edge_lifecycle(ledger):
     from core.city_runner import CityRunner
     runner = CityRunner(WSSS, ledger, 100, 0.08, 0.2)
@@ -84,6 +91,7 @@ def p8_decision_engine(ledger):
         sig.market_date, sig.scanned_at, sig.scan_id = DAY, time.time(), 1
         sig.edge_state = Mock(state="ACTIONABLE")
     runner._state.update(token_matrix={"31°C": {}, "32°C": {}}, market_date=DAY, signals={"31°C": s31, "32°C": s32})
+    recent_scan(ledger)
     with patch.object(WSSS, "paper_trading", True):
         runner.job_order_execution()
     positions = ledger.get_open_positions("WSSS")
@@ -221,6 +229,7 @@ def p12_shadow(ledger):
     sig.market_date, sig.scanned_at, sig.scan_id = DAY, time.time(), 1
     sig.edge_state = Mock(state="ACTIONABLE")
     runner._state.update(token_matrix={"31°C": {}}, market_date=DAY, signals={"31°C": sig})
+    recent_scan(ledger)
     with patch.object(WSSS, "paper_trading", True):
         runner.job_order_execution()
     pos = ledger.get_open_positions("WSSS")[0]
@@ -251,6 +260,68 @@ def p12_shadow(ledger):
     assert "PENDING" in text and "PAPER_FILLED=1" in text
 
 
+def p13_kill_switches(temp):
+    import datetime as dt
+    from core import kill_switch as ks
+    from core import position_monitor as pm
+    from core.city_runner import CityRunner
+    names = lambda ledger, **kw: [n for n, _ in ks.tripped(ledger, "WSSS", 200, DAY, **kw)]  # noqa: E731
+    db = lambda name: Ledger(os.path.join(temp, f"p13_{name}.db"))  # noqa: E731
+
+    healthy = db("ok")
+    recent_scan(healthy)
+    assert names(healthy) == []
+    assert names(db("none")) == ["FORECAST_FEED"]                                   # never scanned
+    assert names(healthy, now=dt.datetime.utcnow() + dt.timedelta(hours=1)) == ["FORECAST_FEED"]  # gone quiet
+    prior = db("prior")
+    prior.log_scan("WSSS", dt.datetime.utcnow().isoformat(), DAY, ForecastResult(31.5, 1, "fallback"), 0, {})
+    assert names(prior) == ["FORECAST_FEED"]                                        # hard prior
+    feed = db("feed")
+    sid = recent_scan(feed)
+    for label, action in (("29°C", "NO_PRICE"), ("30°C", "NO_PRICE"), ("31°C", "HOLD_EDGE")):
+        feed.log_signal(DAY, label, 0.3, 0, 0, action, icao="WSSS", scan_id=sid)
+    assert names(feed) == ["MARKET_FEED"]
+    orders = db("orders")
+    recent_scan(orders)
+    cid = orders.open_order(icao="WSSS", market_date=DAY, token_id="t", bracket="31°C", direction="BUY",
+                            scan_id=1, amount_usd=10, limit_price=0.42, expected_vwap=0.41)
+    assert names(orders) == ["ORDER_UNRESOLVED"]
+    orders.update_order(cid, "FILLED", 10.0, 10.0 / 0.45)                           # reconciled, but 4c worse
+    assert names(orders) == ["SLIPPAGE"]
+    calib = db("calib")
+    recent_scan(calib)
+    calib.log_outcome("WSSS", 31.0, 34.0, DAY)                                      # bias +3°C
+    assert names(calib) == ["CALIBRATION"]
+    loss = db("loss")
+    recent_scan(loss)
+    loss.log_exit("a", "31°C", "BUY", "STOP_LOSS", 0.4, 0.1, 30, -25.0, "x", DAY, icao="WSSS")
+    assert ks.tripped(loss, "WSSS", 200, DAY) == [("DRAWDOWN", True)]               # > 10% of vault today
+    peak = db("peak")
+    recent_scan(peak)
+    for pnl, day in ((10.0, "2026-10-01"), (-45.0, "2026-10-02")):                  # 45 off a +10 peak > 20%
+        peak.log_exit("a", "31°C", "BUY", "STOP_LOSS", 0.4, 0.1, 30, pnl, "x", day, icao="WSSS")
+    assert names(peak) == ["DRAWDOWN"]
+
+    # Job 3 blocks with the switch named; Job 5 flattens through RISK_EXIT.
+    runner = CityRunner(WSSS, loss, 200, 0.08, 0.2)
+    runner.client = Mock()
+    runner.client.get_order_book.return_value = {"bids": [{"price": "0.39", "size": "1000"}],
+                                                 "asks": [{"price": "0.41", "size": "1000"}]}
+    sig = signal()
+    sig.market_date, sig.scanned_at, sig.scan_id, sig.edge_state = DAY, time.time(), 1, Mock(state="ACTIONABLE")
+    runner._state.update(token_matrix={"31°C": {}}, market_date=DAY, signals={"31°C": sig})
+    with patch.object(WSSS, "paper_trading", True):
+        runner.job_order_execution()
+        with loss._conn() as conn:
+            row = conn.execute("SELECT action, reasons FROM decision_log").fetchone()
+        assert row["action"] == "BLOCK" and "KILL_SWITCH:DRAWDOWN" in row["reasons"]
+        loss.record_position("held", "30°C:YES", "WSSS", 0.40, 10.0, DAY, is_paper=True)
+        with patch.object(pm, "fetch_market_price", return_value=MarketPrice("held", 0.45, 0.44, 0.46, 0.02, 400)):
+            runner.job_position_monitor()
+    assert not loss.get_open_positions("WSSS")
+    assert loss.get_exit_log(icao="WSSS")[0]["reason"] == "RISK_EXIT"
+
+
 def main():
     logging.basicConfig(level=logging.CRITICAL)
     with tempfile.TemporaryDirectory() as temp:
@@ -260,7 +331,8 @@ def main():
         p10_exits(Ledger(os.path.join(temp, "p10.db")))
         p11_replay(Ledger(os.path.join(temp, "p11.db")))
         p12_shadow(Ledger(os.path.join(temp, "p12.db")))
-    print("Trading-brain checks passed: P5, P8, P9, P10, P11, P12")
+        p13_kill_switches(temp)
+    print("Trading-brain checks passed: P5, P8, P9, P10, P11, P12, P13")
 
 
 if __name__ == "__main__":

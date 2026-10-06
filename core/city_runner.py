@@ -50,6 +50,7 @@ from core.sizing     import compute_size, compute_validation_size
 from core.execution  import ExecutionEngine, signal_freshness
 from core.decision   import DecisionInputs, ENTER, decide, snapshot
 from core.portfolio  import position_limits
+from core.kill_switch import tripped
 from core.edge       import book_levels
 from config.cities   import CITIES, resolve_vault_usd
 from core.settlement    import SettlementEngine
@@ -291,6 +292,7 @@ class CityRunner:
             logger.info(f"[JOB3:{self.icao}] No actionable signals this cycle.")
             return
 
+        switches = self._kill_switches()
         trailing_bias = self.ledger.fetch_trailing_bias(self.icao)
         engine        = ExecutionEngine(
             self.client, self.ledger, self.vault_usd, self.icao,
@@ -336,7 +338,7 @@ class CityRunner:
             market_date_for_entry = self._state.get(
                 "market_date", self._local_now().strftime("%Y-%m-%d")
             )
-            decision = self._decide(signal, direction, win_prob, sizing, market_date_for_entry)
+            decision = self._decide(signal, direction, win_prob, sizing, market_date_for_entry, switches)
             if decision.action != ENTER:
                 logger.info(f"[JOB3:{self.icao}] {decision.action} {label} [{direction}]: "
                             f"{', '.join(decision.reasons)} (sizing: {sizing.reason})")
@@ -352,7 +354,7 @@ class CityRunner:
             else:
                 logger.warning(f"[JOB3:{self.icao}] ✗ Execution failed or rejected: {label} [{direction}]")
 
-    def _decide(self, signal, direction, win_prob, sizing, market_date):
+    def _decide(self, signal, direction, win_prob, sizing, market_date, switches=()):
         """Assemble the P8 decision inputs from live state, decide, and log the snapshot."""
         token = signal.token_id if direction == "BUY" else signal.no_token_id
         try:
@@ -372,19 +374,27 @@ class CityRunner:
             q_kelly=sizing.size_usd if sizing.verdict == "EXECUTE" else 0.0,
             limits=position_limits(self.ledger.get_open_positions(), self.icao, market_date,
                                    signal.bracket_label, direction, self.vault_usd, _all_vaults_usd()),
-            asks=asks, kill_switches=self._kill_switches(),
+            asks=asks, kill_switches=list(switches),
         )
         decision = decide(inputs)
         self.ledger.log_decision(snapshot(inputs, decision))
         return decision
 
+    def _tripped(self):
+        market_date = self._state.get("market_date") or self._local_now().strftime("%Y-%m-%d")
+        found = tripped(self.ledger, self.icao, self.vault_usd, market_date)
+        for name, flatten in found:
+            logger.critical(f"[KILL:{self.icao}] {name} tripped — "
+                            f"{'flattening positions and ' if flatten else ''}blocking new entries")
+        return found
+
     def _risk_flatten(self) -> bool:
         """True when a tripped kill switch requires closing every position (P13)."""
-        return False
+        return any(flatten for _, flatten in self._tripped())
 
     def _kill_switches(self) -> list:
         """Names of tripped kill switches; any one blocks new entries (P13)."""
-        return []
+        return [name for name, _ in self._tripped()]
 
     # ══════════════════════════════════════════════════════════════════════
     # JOB 4 — Settlement Check (every 15 min, 24/7 — checks today AND yesterday)
