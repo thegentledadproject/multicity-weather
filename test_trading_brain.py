@@ -183,6 +183,31 @@ def p10_exits(ledger):
     assert [r["reason"] for r in out] == [R.STOP_LOSS]
 
 
+def p11_replay(ledger):
+    import sqlite3
+    import replay
+    fc = ForecastResult(31.0, 0.8, "ensemble_blend")
+    for k, at in enumerate(["2026-10-07T00:00:00", "2026-10-07T01:00:00", "2026-10-07T02:00:00"]):
+        sid = ledger.log_scan("WSSS", at, DAY, fc, 0.0, {"31°C": 0.60})
+        ledger.log_book(sid, "yes31", "scan", [(0.39, 1000)], [(0.41, 1000)], at, bracket="31°C")
+        ledger.log_signal(DAY, "31°C", 0.60, 0.40, 0.20, "SIGNAL_BUY", icao="WSSS", scan_id=sid)
+        with ledger._conn() as conn:  # the signal row's time is the scan's time
+            conn.execute("UPDATE signal_log SET timestamp = ? WHERE scan_id = ?", (at, sid))
+    conn = sqlite3.connect(ledger.db_path)
+    conn.row_factory = sqlite3.Row
+    with patch.dict(os.environ, {"VAULT_USD_WSSS": "200", "VAULT_USD_WMKK": "100"}):
+        trades = replay.replay_city(conn, WSSS, 0.08, False, {DAY: 31})
+    conn.close()
+    # Scan 1 is EMERGING (held), scan 2 is ACTIONABLE (enters), scan 3 finds the position open.
+    assert len(trades) == 1
+    t = trades[0]
+    # Kelly 30 (15% cap of $200) = event cap 30 ≤ Qgeo 60, depth ample → $30 at 0.41.
+    assert t["usd"] == 30.0 and abs(t["vwap"] - 0.41) < 1e-12 and t["won"]
+    assert abs(t["pnl"] - (30 / 0.41 - 30 - 30 * 0.02)) < 1e-9
+    assert "INSUFFICIENT DATA" in replay.report(trades)
+    assert replay._no_asks([(0.49, 100)]) == [(0.51, 100)]  # NO asks mirror YES bids
+
+
 def main():
     logging.basicConfig(level=logging.CRITICAL)
     with tempfile.TemporaryDirectory() as temp:
@@ -190,7 +215,8 @@ def main():
         p8_decision_engine(Ledger(os.path.join(temp, "p8.db")))
         p9_order_lifecycle(Ledger(os.path.join(temp, "p9.db")))
         p10_exits(Ledger(os.path.join(temp, "p10.db")))
-    print("Trading-brain checks passed: P5, P8, P9, P10")
+        p11_replay(Ledger(os.path.join(temp, "p11.db")))
+    print("Trading-brain checks passed: P5, P8, P9, P10, P11")
 
 
 if __name__ == "__main__":

@@ -498,7 +498,7 @@ class ExecutionEngine:
         book_2 = self.client.get_order_book(exec_token_id)
         # The book this order is decided on, for replay.
         self.ledger.log_book(getattr(signal, "scan_id", None), exec_token_id, "exec",
-                             book_levels(book_2, "bids"), book_levels(book_2, "asks"))
+                             book_levels(book_2, "bids"), book_levels(book_2, "asks"), bracket=label)
 
         if _is_ghost_book(book_2):
             logger.error(

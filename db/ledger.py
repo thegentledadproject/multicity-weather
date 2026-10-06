@@ -222,6 +222,9 @@ class Ledger:
 
             # scan_id: links signals, positions and exits to the scan_snapshots
             # row (and its books) that produced them.
+            if "bracket" not in [r["name"] for r in conn.execute("PRAGMA table_info(book_snapshots)")]:
+                logger.info("[LEDGER] Migrating: adding bracket to book_snapshots")
+                conn.execute("ALTER TABLE book_snapshots ADD COLUMN bracket TEXT NOT NULL DEFAULT ''")
             if "edge_state" not in [r["name"] for r in conn.execute("PRAGMA table_info(signal_log)")]:
                 logger.info("[LEDGER] Migrating: adding edge_state to signal_log")
                 conn.execute("ALTER TABLE signal_log ADD COLUMN edge_state TEXT NOT NULL DEFAULT ''")
@@ -570,14 +573,14 @@ class Ledger:
 
     def log_book(self, scan_id: Optional[int], token_id: str, purpose: str,
                  bids: List[Tuple[float, float]], asks: List[Tuple[float, float]],
-                 fetched_at: Optional[str] = None):
+                 fetched_at: Optional[str] = None, bracket: str = ""):
         """Full-depth book as [[price, size], ...]; purpose is 'scan' or 'exec'."""
         with self._conn() as conn:
             conn.execute(
-                "INSERT INTO book_snapshots (scan_id, fetched_at, token_id, purpose, bids, asks) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO book_snapshots (scan_id, fetched_at, token_id, purpose, bids, asks, bracket) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (scan_id, fetched_at or datetime.datetime.utcnow().isoformat(), token_id,
-                 purpose, json.dumps(bids), json.dumps(asks)),
+                 purpose, json.dumps(bids), json.dumps(asks), bracket),
             )
 
     def log_decision(self, snap: Dict) -> int:

@@ -232,7 +232,8 @@ class CityRunner:
             sig.edge_state = None
             if sig.market_price and (sig.market_price.bids or sig.market_price.asks):  # Gamma prices carry no book
                 p = sig.market_price
-                self.ledger.log_book(scan_id, p.token_id, "scan", p.bids, p.asks, p.fetched_at)
+                self.ledger.log_book(scan_id, p.token_id, "scan", p.bids, p.asks, p.fetched_at,
+                                     bracket=sig.bracket_label)
             if sig.market_price is not None:
                 # P5: only a persistent, non-decaying edge may trade (see core/edge_state.py).
                 history = self.ledger.edge_history(self.icao, date, sig.bracket_label)
