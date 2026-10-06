@@ -183,6 +183,9 @@ class Ledger:
 
             # scan_id: links signals, positions and exits to the scan_snapshots
             # row (and its books) that produced them.
+            if "edge_state" not in [r["name"] for r in conn.execute("PRAGMA table_info(signal_log)")]:
+                logger.info("[LEDGER] Migrating: adding edge_state to signal_log")
+                conn.execute("ALTER TABLE signal_log ADD COLUMN edge_state TEXT NOT NULL DEFAULT ''")
             for table in ("signal_log", "open_positions", "exit_log"):
                 cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})")]
                 if "scan_id" not in cols:
@@ -465,7 +468,7 @@ class Ledger:
         self, date: str, bracket_label: str,
         model_prob: float, market_price: float,
         edge: float, action: str, gate_reason: str = "",
-        icao: str = "WSSS", scan_id: Optional[int] = None,
+        icao: str = "WSSS", scan_id: Optional[int] = None, edge_state: str = "",
     ):
         """
         gate_reason: previously a schema column that existed but was never
@@ -479,10 +482,21 @@ class Ledger:
         with self._conn() as conn:
             conn.execute(
                 "INSERT INTO signal_log "
-                "(timestamp, date, icao_code, bracket_label, model_prob, market_price, edge, action, gate_reason, scan_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (ts, date, icao.upper(), bracket_label, model_prob, market_price, edge, action, gate_reason, scan_id),
+                "(timestamp, date, icao_code, bracket_label, model_prob, market_price, edge, action, gate_reason, "
+                "scan_id, edge_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (ts, date, icao.upper(), bracket_label, model_prob, market_price, edge, action, gate_reason,
+                 scan_id, edge_state),
             )
+
+    def edge_history(self, icao: str, date: str, bracket_label: str, limit: int = 8) -> List[Tuple[str, float]]:
+        """[(utc timestamp, edge)] of this bracket's priced scans for the market date, oldest first."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT timestamp, edge FROM signal_log WHERE icao_code = ? AND date = ? AND bracket_label = ? "
+                "AND action != 'NO_PRICE' ORDER BY id DESC LIMIT ?",
+                (icao.upper(), date, bracket_label, limit),
+            ).fetchall()
+        return [(r["timestamp"], r["edge"]) for r in reversed(rows)]
 
     def mark_signal_settled(self, date: str, bracket_label: str, outcome: str, icao: str = "WSSS"):
         with self._conn() as conn:

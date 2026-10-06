@@ -45,6 +45,7 @@ from db.ledger       import Ledger
 from core.discovery  import MarketDiscovery
 from core.model      import BracketModel, fetch_gfs_forecast
 from core.edge       import scan_all_brackets, MAX_EDGE_MAGNITUDE
+from core.edge_state import edge_lifecycle, ACTIONABLE
 from core.sizing     import compute_size, compute_validation_size
 from core.execution  import ExecutionEngine
 from core.settlement    import SettlementEngine
@@ -215,15 +216,21 @@ class CityRunner:
             max_edge_magnitude = self.max_edge_magnitude,
         )
         date = self._state.get("market_date", self._local_now().strftime("%Y-%m-%d"))
-        scan_id = self.ledger.log_scan(
-            self.icao, datetime.datetime.utcfromtimestamp(scanned_at).isoformat(), date,
-            forecast, trailing_bias, model_probs,
-        )
+        scan_iso = datetime.datetime.utcfromtimestamp(scanned_at).isoformat()
+        scan_id = self.ledger.log_scan(self.icao, scan_iso, date, forecast, trailing_bias, model_probs)
         for sig in signals.values():
             sig.market_date, sig.scanned_at, sig.scan_id = date, scanned_at, scan_id
+            sig.edge_state = None
             if sig.market_price and (sig.market_price.bids or sig.market_price.asks):  # Gamma prices carry no book
                 p = sig.market_price
                 self.ledger.log_book(scan_id, p.token_id, "scan", p.bids, p.asks, p.fetched_at)
+            if sig.market_price is not None:
+                # P5: only a persistent, non-decaying edge may trade (see core/edge_state.py).
+                history = self.ledger.edge_history(self.icao, date, sig.bracket_label)
+                sig.edge_state = edge_lifecycle(history + [(scan_iso, sig.edge)], self.edge_threshold)
+                if sig.actionable and sig.edge_state.state != ACTIONABLE:
+                    sig.actionable = False
+                    sig.gate_reason = f"EDGE_{sig.edge_state.state}"
         self._state["signals"] = signals
 
         # Log ALL signals to DB — including non-actionable, gated, and held —
@@ -239,6 +246,7 @@ class CityRunner:
                 action        = sig.action_label,
                 icao          = self.icao,
                 scan_id       = scan_id,
+                edge_state    = sig.edge_state.state if sig.edge_state else "",
             )
 
         buys  = [l for l, s in signals.items() if s.direction == "BUY"  and s.actionable]
