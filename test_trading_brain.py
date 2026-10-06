@@ -208,6 +208,49 @@ def p11_replay(ledger):
     assert replay._no_asks([(0.49, 100)]) == [(0.51, 100)]  # NO asks mirror YES bids
 
 
+def p12_shadow(ledger):
+    import sqlite3
+    import shadow_report
+    from core.city_runner import CityRunner
+    from core.settlement import SettlementEngine
+    runner = CityRunner(WSSS, ledger, 100, 0.08, 0.2)
+    runner.client = Mock()
+    runner.client.get_order_book.return_value = {"bids": [{"price": "0.39", "size": "1000"}],
+                                                 "asks": [{"price": "0.41", "size": "1000"}]}
+    sig = signal()
+    sig.market_date, sig.scanned_at, sig.scan_id = DAY, time.time(), 1
+    sig.edge_state = Mock(state="ACTIONABLE")
+    runner._state.update(token_matrix={"31°C": {}}, market_date=DAY, signals={"31°C": sig})
+    with patch.object(WSSS, "paper_trading", True):
+        runner.job_order_execution()
+    pos = ledger.get_open_positions("WSSS")[0]
+    # The market resolves YES for 31°C: settlement logs the held YES as an exit at 1.0.
+    resolved = Mock()
+    resolved.json.return_value = [{"closed": True, "outcomePrices": '["1", "0"]'}]
+    with patch("core.settlement.requests.get", return_value=resolved):
+        assert SettlementEngine(ledger, WSSS)._check_resolution("yes", "31°C:YES", DAY, position=pos)
+    exit_row = ledger.get_exit_log(icao="WSSS")[0]
+    shares = 15.0 / 0.41
+    assert exit_row["reason"] == "SETTLED" and exit_row["exit_price"] == 1.0
+    assert abs(exit_row["realised_pnl"] - (1 - 0.41) * shares) < 1e-9 and exit_row["scan_id"] == 1
+    # A NO held into a YES resolution settles at 0.
+    ledger.record_position("no32", "32°C:NO", "WSSS", 0.60, 6.0, DAY, is_paper=True, scan_id=2)
+    with patch("core.settlement.requests.get", return_value=resolved):
+        SettlementEngine(ledger, WSSS)._check_resolution("no32", "32°C:NO", DAY,
+                                                          position=ledger.get_open_positions("WSSS")[0])
+    assert ledger.get_exit_log(icao="WSSS")[0]["realised_pnl"] == -6.0
+
+    conn = sqlite3.connect(ledger.db_path)
+    conn.row_factory = sqlite3.Row
+    rows = shadow_report.entries(conn, "WSSS")
+    text = shadow_report.report(conn, "WSSS")
+    conn.close()
+    assert len(rows) == 1 and rows[0]["order"]["state"] == "PAPER_FILLED"
+    assert rows[0]["order"]["expected_vwap"] == rows[0]["expected_vwap"]  # paper: no drift
+    assert abs(rows[0]["pnl"] - (1 - 0.41) * shares) < 1e-9
+    assert "PENDING" in text and "PAPER_FILLED=1" in text
+
+
 def main():
     logging.basicConfig(level=logging.CRITICAL)
     with tempfile.TemporaryDirectory() as temp:
@@ -216,7 +259,8 @@ def main():
         p9_order_lifecycle(Ledger(os.path.join(temp, "p9.db")))
         p10_exits(Ledger(os.path.join(temp, "p10.db")))
         p11_replay(Ledger(os.path.join(temp, "p11.db")))
-    print("Trading-brain checks passed: P5, P8, P9, P10, P11")
+        p12_shadow(Ledger(os.path.join(temp, "p12.db")))
+    print("Trading-brain checks passed: P5, P8, P9, P10, P11, P12")
 
 
 if __name__ == "__main__":
