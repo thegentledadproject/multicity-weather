@@ -144,6 +144,17 @@ def main():
         conn = sqlite3.connect(old)
         assert "scan_id" in {r[1] for r in conn.execute("PRAGMA table_info(signal_log)")}
         conn.close()
+        # A DB from the single-city wsss-weatherbot has scan_snapshots without icao_code.
+        legacy = os.path.join(temp, "legacy.db")
+        conn = sqlite3.connect(legacy)
+        conn.execute("CREATE TABLE scan_snapshots (id INTEGER PRIMARY KEY, scan_at TEXT, market_date TEXT, "
+                     "forecast_source TEXT, mu REAL, sigma REAL, mu_gfs REAL, mu_ecmwf REAL, sigma_gfs REAL, "
+                     "sigma_ecmwf REAL, trailing_bias REAL, model_probs TEXT)")
+        conn.execute("INSERT INTO scan_snapshots VALUES (1, '2026-10-06T00:00:00', '2026-10-06', 'x', 31, 1, "
+                     "NULL, NULL, NULL, NULL, 0, '{}')")
+        conn.commit()
+        conn.close()
+        assert Ledger(legacy).scan_as_of("WSSS", "2026-10-06", "9999")["id"] == 1
 
         # ── P3: freshness / information integrity ─────────────────────────────
         now = time.time()
