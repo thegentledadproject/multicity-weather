@@ -90,6 +90,18 @@ def main():
     assert live[0]["model"] == [0.7, 0.3] and live[0]["market"] == [0.55, 0.45]
     assert live[0]["outcome"] == [0, 1] and labels == ["31°C", "32°C"]
     assert "INSUFFICIENT DATA" in cr.verdict_lines(live, "x")[0]
+
+    # Breaker: one failure is skipped, MAX_CONSECUTIVE_FAILURES in a row stop downloads.
+    def fail():
+        raise cr.requests.ConnectionError("flaky")
+    with tempfile.TemporaryDirectory() as temp, patch.object(cr, "CACHE", cr.pathlib.Path(temp)), \
+            patch.object(cr, "PRICE_REQUEST_GAP_S", 0), \
+            patch.dict(cr._polymarket, {"blocked": False, "missing": 0, "failures": 0}):
+        assert cr._polymarket_cached("a", fail) is None and not cr._polymarket["blocked"]
+        assert cr._polymarket_cached("b", lambda: [1]) == [1] and cr._polymarket["failures"] == 0
+        for name in "cde":
+            cr._polymarket_cached(name, fail)
+        assert cr._polymarket["blocked"] and cr._polymarket_cached("f", lambda: [1]) is None
     print("Calibration report checks passed: scoring, no look-ahead in forecasts, prices or bias.")
 
 

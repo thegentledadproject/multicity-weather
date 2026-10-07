@@ -142,7 +142,10 @@ def fetch_station_highs(cfg, start: str, end: str) -> Dict[str, int]:
 
 # Polymarket blocks bursts from one IP. Once it stops answering, remaining
 # uncached events/prices are skipped (not cached) and a rerun fills them in.
-_polymarket = {"blocked": False, "missing": 0}
+# Single failures are common (the connection here is flaky), so only
+# MAX_CONSECUTIVE_FAILURES in a row stop the run's downloads.
+MAX_CONSECUTIVE_FAILURES = 3
+_polymarket = {"blocked": False, "missing": 0, "failures": 0}
 
 
 def _polymarket_cached(name: str, fetch):
@@ -152,11 +155,17 @@ def _polymarket_cached(name: str, fetch):
             return None
         time.sleep(PRICE_REQUEST_GAP_S)
     try:
-        return cached(name, fetch)
+        value = cached(name, fetch)
+        _polymarket["failures"] = 0
+        return value
     except requests.RequestException as e:
-        logger.error(f"Polymarket unavailable, skipping uncached downloads this run: {e}")
-        _polymarket["blocked"] = True
         _polymarket["missing"] += 1
+        _polymarket["failures"] += 1
+        if _polymarket["failures"] >= MAX_CONSECUTIVE_FAILURES:
+            logger.error(f"Polymarket unavailable, skipping uncached downloads this run: {e}")
+            _polymarket["blocked"] = True
+        else:
+            logger.warning(f"Polymarket download failed, skipping {name}: {e}")
         return None
 
 
