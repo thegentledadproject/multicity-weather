@@ -148,42 +148,11 @@ def fetch_asos_daily_max(icao: str, timezone: str, date: str, timeout: int = 15)
         return None
 
 
-# ── WSSS: NEA Changi (S24) — secondary fallback behind ASOS ──────────────────
-NEA_READINGS_URL = "https://api.data.gov.sg/v1/environment/air-temperature?date={date}"
-CHANGI_STATION_ID = "S24"
-
-
-def fetch_nea_changi(date: str, timeout: int = 15) -> Optional[float]:
-    """NEA data.gov.sg air-temperature reading for Changi station S24."""
-    try:
-        resp = requests.get(NEA_READINGS_URL.format(date=date), timeout=timeout)
-        resp.raise_for_status()
-        data = resp.json()
-
-        readings = data.get("items", [])
-        changi_max = None
-        for item in readings:
-            for reading in item.get("readings", []):
-                if reading.get("station_id") == CHANGI_STATION_ID:
-                    val = reading.get("value")
-                    if val is not None:
-                        changi_max = max(changi_max or 0.0, float(val))
-
-        if changi_max is not None:
-            logger.info(f"[CITIES] NEA Changi actual max = {changi_max:.2f}°C")
-        return changi_max
-
-    except Exception as e:
-        logger.error(f"[CITIES] NEA Changi fetch failed: {e}")
-        return None
-
-
-def _wsss_official_fetcher(date: str, timeout: int = 15) -> Optional[float]:
-    """ASOS (WSSS/Changi) primary, NEA Changi S24 secondary if ASOS has no reading for the date."""
-    asos = fetch_asos_daily_max("WSSS", "Asia/Singapore", date, timeout)
-    if asos is not None:
-        return asos
-    return fetch_nea_changi(date, timeout)
+# No secondary station source: NEA's data.gov.sg feed reads Changi S24, a
+# different sensor from the WSSS METAR that settles the market, so falling
+# back to it would calibrate against a number the market never resolves on.
+# If ASOS has no reading, core/settlement.py writes no calibration row and
+# Job 4 retries next cycle (there is no fallback source for any city).
 
 
 def _bracket_range(low: int, high: int) -> Dict[str, Tuple[float, float]]:
@@ -232,7 +201,7 @@ CITIES: Dict[str, CityConfig] = {
         default_vault_usd=200.0,
         hard_prior_mu=31.5,
         hard_prior_sigma=1.0,
-        official_station_fetcher=_wsss_official_fetcher,
+        official_station_fetcher=functools.partial(fetch_asos_daily_max, "WSSS", "Asia/Singapore"),
         settlement_station="Singapore Changi Airport",
         # Paper trading, same as WMKK (see CityConfig.paper_trading) — its
         # bracket range/settlement source were both corrected this session
@@ -279,8 +248,7 @@ CITIES: Dict[str, CityConfig] = {
         hard_prior_sigma=1.2,
         # ASOS/METAR archive for WMKK (KL Intl Airport) — confirmed exact
         # match against a live Polymarket resolution (Jul 8, 2026 -> 33°C).
-        # No Malaysian government equivalent of NEA's data.gov.sg API is
-        # wired, so this is the only official-station source for WMKK.
+        # The only station source, as for WSSS: it is the settlement METAR.
         official_station_fetcher=functools.partial(fetch_asos_daily_max, "WMKK", "Asia/Kuala_Lumpur"),
         settlement_station="Kuala Lumpur Intl Airport",
         # WMKK is new/unproven (bracket ranges and skew table only recently
