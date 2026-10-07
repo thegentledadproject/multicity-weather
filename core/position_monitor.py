@@ -36,6 +36,21 @@ EXIT CONDITIONS (priority order):
     16:00 local-time hard close (per-city, see HARD_EXIT_HOUR/`timezone`
     param), all positions, best available price.
 
+  P10 exit families (win_prob = model probability the HELD side wins, i.e.
+  P(bracket) for YES and 1 - P(bracket) for NO):
+    RISK_EXIT         a kill switch asks to flatten (core/kill_switch.py)
+    INFORMATION_EXIT  the model's probabilities are older than
+                      INFO_EXIT_AFTER_S: the position is no longer backed by
+                      current information
+    MODEL_EXIT        win_prob < mid - edge_threshold: the model now says
+                      the held side is overpriced, the reverse of the entry
+    SETTLEMENT_EXIT   best bid >= win_prob: selling now is worth at least
+                      the expected value of holding to settlement
+    PRICE_EXIT        in profit and mid >= win_prob - PRICE_EXIT_MARGIN: the
+                      market has converged to fair value, take it
+  Model-based exits are skipped when win_prob is unknown (no scan yet,
+  e.g. right after a restart); stops and the time exit always run.
+
 TRAIL_PCT is configurable via env var TRAIL_PCT (default 0.20).
 Set lower (e.g. 0.10) for tighter stops on thin books.
 Set higher (e.g. 0.30) to tolerate more intraday noise.
@@ -70,11 +85,20 @@ EDGE_THRESHOLD   = 0.05   # injected by scheduler from env
 TRAIL_PCT        = float(os.getenv("TRAIL_PCT", 0.20))
 
 
+INFO_EXIT_AFTER_S = float(os.getenv("INFO_EXIT_AFTER_S", str(2 * 3600)))
+PRICE_EXIT_MARGIN = 0.02
+
+
 class ExitReason:
-    TRAILING_STOP = "TRAILING_STOP"
-    STOP_LOSS     = "STOP_LOSS"
-    TIME_EXIT     = "TIME_EXIT"
-    NONE          = "NONE"
+    TRAILING_STOP    = "TRAILING_STOP"
+    STOP_LOSS        = "STOP_LOSS"
+    TIME_EXIT        = "TIME_EXIT"
+    RISK_EXIT        = "RISK_EXIT"
+    INFORMATION_EXIT = "INFORMATION_EXIT"
+    MODEL_EXIT       = "MODEL_EXIT"
+    SETTLEMENT_EXIT  = "SETTLEMENT_EXIT"
+    PRICE_EXIT       = "PRICE_EXIT"
+    NONE             = "NONE"
 
 
 class ExitDecision:
@@ -132,6 +156,9 @@ def evaluate_exit(
     trail_pct:       float,
     ledger:          Ledger,
     force_time_exit: bool = False,
+    win_prob:        Optional[float] = None,
+    info_stale:      bool = False,
+    risk_flatten:    bool = False,
 ) -> ExitDecision:
     """
     Evaluate whether to exit a position using trailing stop logic.
@@ -144,12 +171,14 @@ def evaluate_exit(
     direction = _parse_direction(position_label)
     label     = _parse_bracket(position_label)
 
-    # ── Time exit: no price check needed ──────────────────────────────────────
-    if force_time_exit:
+    # ── Time / risk / information exits: no price check needed ────────────────
+    forced = (ExitReason.TIME_EXIT if force_time_exit else ExitReason.RISK_EXIT if risk_flatten
+              else ExitReason.INFORMATION_EXIT if info_stale else None)
+    if forced:
         market_price = fetch_market_price(token_id)
         return ExitDecision(
             token_id=token_id, label=label, direction=direction,
-            reason=ExitReason.TIME_EXIT,
+            reason=forced,
             entry_price=entry_price, peak_price=peak_price,
             trail_level=None,
             current_mid=market_price.mid_price if market_price else entry_price,
@@ -201,6 +230,12 @@ def evaluate_exit(
         reason = ExitReason.TRAILING_STOP
     elif stop_trigger:
         reason = ExitReason.STOP_LOSS
+    elif win_prob is not None and win_prob < mid - edge_threshold:
+        reason = ExitReason.MODEL_EXIT
+    elif win_prob is not None and market_price.best_bid >= win_prob:
+        reason = ExitReason.SETTLEMENT_EXIT
+    elif win_prob is not None and mid > entry_price and mid >= win_prob - PRICE_EXIT_MARGIN:
+        reason = ExitReason.PRICE_EXIT
     else:
         reason = ExitReason.NONE
 
@@ -316,8 +351,14 @@ class PositionMonitor:
         # per-position force_time_exit check to this city's own local time.
         self.timezone       = pytz.timezone(timezone)
 
-    def run(self, model_probs: Dict[str, float], market_date: str = "") -> List[Dict]:
+    def run(self, model_probs: Dict[str, float], market_date: str = "",
+            probs_age_s: Optional[float] = None, risk_flatten: bool = False) -> List[Dict]:
         """
+        model_probs: P(bracket) from the latest Job 2 scan ({} if none yet);
+        probs_age_s: seconds since that scan (None if unknown, e.g. after a
+        restart, in which case the information exit can't fire);
+        risk_flatten: a kill switch demands every position be closed.
+
         market_date: today's SGT calendar date (from _state["market_date"]).
         Used to scope the 16:00 hard time-exit to genuinely STALE positions
         only — see per-position force_time_exit logic below.
@@ -345,7 +386,11 @@ class PositionMonitor:
             peak_price     = float(pos["peak_price"]) if pos["peak_price"] is not None else entry_price
 
             bracket_label  = _parse_bracket(position_label)
-            model_prob     = model_probs.get(bracket_label, 0.5)
+            # Probability the HELD side wins: P(bracket) for YES, 1 - P for NO.
+            p_bracket      = model_probs.get(bracket_label)
+            win_prob       = None if p_bracket is None else (
+                p_bracket if _parse_direction(position_label) == "BUY" else 1.0 - p_bracket)
+            model_prob     = p_bracket if p_bracket is not None else 0.5  # logging only
 
             # ── Per-position force_time_exit ────────────────────────────────
             # Required by the round-the-clock scheduler redesign: Jobs 2/3 can
@@ -409,6 +454,9 @@ class PositionMonitor:
                     trail_pct       = self.trail_pct,
                     ledger          = self.ledger,
                     force_time_exit = force_time_exit,
+                    win_prob        = win_prob,
+                    info_stale      = probs_age_s is not None and probs_age_s > INFO_EXIT_AFTER_S,
+                    risk_flatten    = risk_flatten,
                 )
             except Exception as e:
                 logger.error(

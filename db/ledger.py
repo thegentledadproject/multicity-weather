@@ -7,10 +7,13 @@ Tables:
   token_matrix      : today's bracket → token_id mapping (refreshed daily)
   scan_snapshots    : append-only inputs of each Job 2 scan (forecast, bias, probs)
   book_snapshots    : append-only full order books seen at scan and at execution
+  decision_log      : every entry decision with its full input snapshot (P8)
+  order_log         : every order's lifecycle, SUBMITTED -> FILLED/REJECTED/UNKNOWN (P9)
 """
 
 import json
 import sqlite3
+import uuid
 import datetime
 import logging
 import contextlib
@@ -135,6 +138,42 @@ class Ledger:
                     model_probs      TEXT    NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS decision_log (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    decided_at  TEXT    NOT NULL,
+                    icao_code   TEXT    NOT NULL,
+                    market_date TEXT    NOT NULL,
+                    bracket     TEXT    NOT NULL,
+                    direction   TEXT    NOT NULL,
+                    scan_id     INTEGER,
+                    action      TEXT    NOT NULL,
+                    reasons     TEXT    NOT NULL,
+                    snapshot    TEXT    NOT NULL
+                );
+
+                -- An order is written BEFORE it is posted, so a crash or API
+                -- timeout leaves a SUBMITTED/UNKNOWN row instead of nothing.
+                CREATE TABLE IF NOT EXISTS order_log (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    client_order_id TEXT    NOT NULL UNIQUE,
+                    created_at      TEXT    NOT NULL,
+                    updated_at      TEXT    NOT NULL,
+                    icao_code       TEXT    NOT NULL,
+                    market_date     TEXT    NOT NULL,
+                    token_id        TEXT    NOT NULL,
+                    bracket         TEXT    NOT NULL,
+                    direction       TEXT    NOT NULL,
+                    scan_id         INTEGER,
+                    amount_usd      REAL    NOT NULL,
+                    limit_price     REAL,
+                    expected_vwap   REAL,
+                    state           TEXT    NOT NULL,
+                    is_paper        INTEGER NOT NULL DEFAULT 0,
+                    filled_usd      REAL,
+                    filled_shares   REAL,
+                    response        TEXT    NOT NULL DEFAULT ''
+                );
+
                 CREATE TABLE IF NOT EXISTS book_snapshots (
                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
                     scan_id     INTEGER,
@@ -183,6 +222,12 @@ class Ledger:
 
             # scan_id: links signals, positions and exits to the scan_snapshots
             # row (and its books) that produced them.
+            if "bracket" not in [r["name"] for r in conn.execute("PRAGMA table_info(book_snapshots)")]:
+                logger.info("[LEDGER] Migrating: adding bracket to book_snapshots")
+                conn.execute("ALTER TABLE book_snapshots ADD COLUMN bracket TEXT NOT NULL DEFAULT ''")
+            if "edge_state" not in [r["name"] for r in conn.execute("PRAGMA table_info(signal_log)")]:
+                logger.info("[LEDGER] Migrating: adding edge_state to signal_log")
+                conn.execute("ALTER TABLE signal_log ADD COLUMN edge_state TEXT NOT NULL DEFAULT ''")
             for table in ("signal_log", "open_positions", "exit_log"):
                 cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})")]
                 if "scan_id" not in cols:
@@ -473,7 +518,7 @@ class Ledger:
         self, date: str, bracket_label: str,
         model_prob: float, market_price: float,
         edge: float, action: str, gate_reason: str = "",
-        icao: str = "WSSS", scan_id: Optional[int] = None,
+        icao: str = "WSSS", scan_id: Optional[int] = None, edge_state: str = "",
     ):
         """
         gate_reason: previously a schema column that existed but was never
@@ -487,10 +532,21 @@ class Ledger:
         with self._conn() as conn:
             conn.execute(
                 "INSERT INTO signal_log "
-                "(timestamp, date, icao_code, bracket_label, model_prob, market_price, edge, action, gate_reason, scan_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (ts, date, icao.upper(), bracket_label, model_prob, market_price, edge, action, gate_reason, scan_id),
+                "(timestamp, date, icao_code, bracket_label, model_prob, market_price, edge, action, gate_reason, "
+                "scan_id, edge_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (ts, date, icao.upper(), bracket_label, model_prob, market_price, edge, action, gate_reason,
+                 scan_id, edge_state),
             )
+
+    def edge_history(self, icao: str, date: str, bracket_label: str, limit: int = 8) -> List[Tuple[str, float]]:
+        """[(utc timestamp, edge)] of this bracket's priced scans for the market date, oldest first."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT timestamp, edge FROM signal_log WHERE icao_code = ? AND date = ? AND bracket_label = ? "
+                "AND action != 'NO_PRICE' ORDER BY id DESC LIMIT ?",
+                (icao.upper(), date, bracket_label, limit),
+            ).fetchall()
+        return [(r["timestamp"], r["edge"]) for r in reversed(rows)]
 
     def mark_signal_settled(self, date: str, bracket_label: str, outcome: str, icao: str = "WSSS"):
         with self._conn() as conn:
@@ -517,15 +573,68 @@ class Ledger:
 
     def log_book(self, scan_id: Optional[int], token_id: str, purpose: str,
                  bids: List[Tuple[float, float]], asks: List[Tuple[float, float]],
-                 fetched_at: Optional[str] = None):
+                 fetched_at: Optional[str] = None, bracket: str = ""):
         """Full-depth book as [[price, size], ...]; purpose is 'scan' or 'exec'."""
         with self._conn() as conn:
             conn.execute(
-                "INSERT INTO book_snapshots (scan_id, fetched_at, token_id, purpose, bids, asks) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO book_snapshots (scan_id, fetched_at, token_id, purpose, bids, asks, bracket) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (scan_id, fetched_at or datetime.datetime.utcnow().isoformat(), token_id,
-                 purpose, json.dumps(bids), json.dumps(asks)),
+                 purpose, json.dumps(bids), json.dumps(asks), bracket),
             )
+
+    def log_decision(self, snap: Dict) -> int:
+        """Append a core.decision.snapshot(); returns the decision_log id."""
+        i, d = snap["inputs"], snap["decision"]
+        with self._conn() as conn:
+            return conn.execute(
+                "INSERT INTO decision_log (decided_at, icao_code, market_date, bracket, direction, scan_id, "
+                "action, reasons, snapshot) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (datetime.datetime.utcnow().isoformat(), i["icao"].upper(), i["market_date"], i["bracket"],
+                 i["direction"], i["scan_id"], d["action"], json.dumps(d["reasons"]), json.dumps(snap)),
+            ).lastrowid
+
+    # -- Orders (P9) ------------------------------------------------------------
+
+    def open_order(self, *, icao: str, market_date: str, token_id: str, bracket: str, direction: str,
+                   scan_id: Optional[int], amount_usd: float, limit_price: Optional[float],
+                   expected_vwap: float, state: str = "SUBMITTED", is_paper: bool = False) -> str:
+        """Record an order before it is sent; returns its client_order_id."""
+        cid = uuid.uuid4().hex
+        ts = datetime.datetime.utcnow().isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO order_log (client_order_id, created_at, updated_at, icao_code, market_date, token_id, "
+                "bracket, direction, scan_id, amount_usd, limit_price, expected_vwap, state, is_paper) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (cid, ts, ts, icao.upper(), market_date, token_id, bracket, direction, scan_id,
+                 amount_usd, limit_price, expected_vwap, state, int(is_paper)),
+            )
+        return cid
+
+    def update_order(self, cid: str, state: str, filled_usd: Optional[float] = None,
+                     filled_shares: Optional[float] = None, response: str = ""):
+        """Move an order to its next state. To reconcile an UNKNOWN order by hand,
+        check the wallet and call this with FILLED (plus amounts) or REJECTED."""
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE order_log SET state = ?, filled_usd = ?, filled_shares = ?, response = ?, updated_at = ? "
+                "WHERE client_order_id = ?",
+                (state, filled_usd, filled_shares, response[:2000], datetime.datetime.utcnow().isoformat(), cid),
+            )
+
+    def unresolved_orders(self, icao: Optional[str] = None, token_id: Optional[str] = None) -> List[sqlite3.Row]:
+        """Orders whose outcome is not known (SUBMITTED or UNKNOWN): they may have filled."""
+        query = "SELECT * FROM order_log WHERE state IN ('SUBMITTED', 'UNKNOWN')"
+        params: list = []
+        if icao:
+            query += " AND icao_code = ?"
+            params.append(icao.upper())
+        if token_id:
+            query += " AND token_id = ?"
+            params.append(token_id)
+        with self._conn() as conn:
+            return conn.execute(query, params).fetchall()
 
     def scan_as_of(self, icao: str, market_date: str, at: str) -> Optional[dict]:
         """

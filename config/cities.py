@@ -163,6 +163,16 @@ def _bracket_range(low: int, high: int) -> Dict[str, Tuple[float, float]]:
     return bounds
 
 
+# _NO_SKEW_EVIDENCE — both cities used hand-set left skews (alpha -0.8 to
+# -2.2 by month). With loc at the forecast, a skew-normal's MEAN sits ~0.7
+# sigma below it, so the model ran systematically cold, and P4 calibration
+# (calibration_report.py, point-in-time replay 2024-06..2026-10, both cities)
+# showed it worse than climatology: Brier 0.830 vs 0.788, CI excluding zero,
+# overconfident mid-range and starved tails. Choosing variants on 2024-25 and
+# scoring 2026 only: skewed 0.807, climatology 0.794, no skew 0.719 (best on
+# 2024-25 too, and simplest). Re-introduce skew only with out-of-sample
+# evidence from calibration_report.py.
+
 # Live for both cities as of 2026-10-07 ("28°C or below" ... "38°C or higher"),
 # up from July's 26-36. Ranges move with the season; core/discovery.py's
 # settlement gate blocks a city whose live event no longer matches this.
@@ -184,18 +194,10 @@ CITIES: Dict[str, CityConfig] = {
         # ("26°C or below" / "36°C or above"), not narrow 1-degree bins.
         bracket_labels=list(_BRACKETS_28_38),
         bracket_bounds=_BRACKETS_28_38,
-        # Negative = left skew (colder tail heavier). SW monsoon months
-        # (May-Sep): stronger left skew. Moved verbatim from core/model.py's
-        # old SKEW_ALPHA_TABLE[("WSSS", month)].
-        skew_alpha_by_month={
-            1: -1.0, 2: -1.0,
-            3: -1.2, 4: -1.8,
-            5: -2.0, 6: -2.2,
-            7: -2.2, 8: -2.0,
-            9: -1.8, 10: -1.3,
-            11: -1.0, 12: -1.0,
-        },
-        default_skew_alpha=-1.5,
+        # No skew: a normal distribution centred on the bias-corrected
+        # forecast. See _NO_SKEW_EVIDENCE above.
+        skew_alpha_by_month={},
+        default_skew_alpha=0.0,
         # Own vault, independent of WMKK's — override via VAULT_USD_WSSS
         # (or the legacy MAX_VAULT_ALLOCATION env var) without touching code.
         default_vault_usd=200.0,
@@ -229,19 +231,10 @@ CITIES: Dict[str, CityConfig] = {
         # open-ended catch-alls, same as WSSS.
         bracket_labels=list(_BRACKETS_28_38),
         bracket_bounds=_BRACKETS_28_38,
-        # KL's NE monsoon (wet season, Nov-Mar) is milder than Singapore's SW
-        # monsoon skew; dry inter-monsoon months (Jun-Sep, haze-prone) trend
-        # hotter with a heavier left tail. Estimated, not yet calibrated
-        # against real settlement data (see core/settlement.py trailing bias).
-        skew_alpha_by_month={
-            1: -0.8, 2: -0.8,
-            3: -1.0, 4: -1.3,
-            5: -1.5, 6: -1.8,
-            7: -1.8, 8: -1.6,
-            9: -1.4, 10: -1.0,
-            11: -0.8, 12: -0.8,
-        },
-        default_skew_alpha=-1.3,
+        # No skew: a normal distribution centred on the bias-corrected
+        # forecast. See _NO_SKEW_EVIDENCE above.
+        skew_alpha_by_month={},
+        default_skew_alpha=0.0,
         # Own vault, independent of WSSS's — override via VAULT_USD_WMKK.
         default_vault_usd=100.0,
         hard_prior_mu=33.0,

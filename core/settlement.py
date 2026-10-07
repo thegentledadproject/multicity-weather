@@ -89,6 +89,7 @@ class SettlementEngine:
                 token_id      = pos["token_id"],
                 bracket_label = pos["bracket_label"],
                 market_date   = pos_market_date,
+                position      = pos,
             )
             if settled:
                 results["positions_settled"] += 1
@@ -138,7 +139,8 @@ class SettlementEngine:
 
         return results
 
-    def _check_resolution(self, token_id: str, bracket_label: str, market_date: str = "") -> bool:
+    def _check_resolution(self, token_id: str, bracket_label: str, market_date: str = "",
+                          position=None) -> bool:
         """
         S1: Check Gamma API outcomePrices for terminal state.
         Returns True if the market has resolved and position was closed.
@@ -181,10 +183,24 @@ class SettlementEngine:
                 f"(outcomePrices[0]={yes_price:.4f})"
             )
 
+            bracket = bracket_label.split(":")[0]  # positions are labelled "31°C:YES" / "31°C:NO"
+            if position is not None:
+                # A position held to resolution is an exit at 1 (held side won) or 0;
+                # without this row its P&L never reaches exit_log or the dashboard.
+                held_no = bracket_label.endswith(":NO")
+                exit_price = 1.0 if (outcome == "NO") == held_no else 0.0
+                entry, size = float(position["entry_price"]), float(position["size_usd"])
+                self.ledger.log_exit(
+                    token_id=token_id, bracket_label=bracket, direction="SELL" if held_no else "BUY",
+                    reason="SETTLED", entry_price=entry, exit_price=exit_price, size_usd=size,
+                    realised_pnl=(exit_price - entry) * size / entry, opened_at=position["opened_at"],
+                    market_date=market_date, icao=self.icao, is_paper=bool(position["is_paper"]),
+                    scan_id=position["scan_id"],
+                )
             self.ledger.close_position(token_id)
             self.ledger.mark_signal_settled(
                 date          = market_date or market.get("endDate", "")[:10],
-                bracket_label = bracket_label,
+                bracket_label = bracket,
                 outcome       = outcome,
                 icao          = self.icao,
             )

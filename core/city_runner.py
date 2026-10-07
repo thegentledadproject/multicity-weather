@@ -45,8 +45,14 @@ from db.ledger       import Ledger
 from core.discovery  import MarketDiscovery
 from core.model      import BracketModel, fetch_gfs_forecast
 from core.edge       import scan_all_brackets, MAX_EDGE_MAGNITUDE
+from core.edge_state import edge_lifecycle, ACTIONABLE
 from core.sizing     import compute_size, compute_validation_size
-from core.execution  import ExecutionEngine
+from core.execution  import ExecutionEngine, signal_freshness
+from core.decision   import DecisionInputs, ENTER, decide, snapshot
+from core.portfolio  import position_limits
+from core.kill_switch import tripped
+from core.edge       import book_levels
+from config.cities   import CITIES, resolve_vault_usd
 from core.settlement    import SettlementEngine
 from core.position_monitor import PositionMonitor
 
@@ -59,6 +65,10 @@ logger = logging.getLogger("hermes.city_runner")
 # real rollover (below) can reuse it instead of a fresh fetch — it does
 # NOT make Jobs 2/3/4/5 trade the next day's market early.
 LOOKAHEAD_START_HOUR = int(os.getenv("LOOKAHEAD_START_HOUR", "22"))
+
+
+def _all_vaults_usd() -> float:
+    return sum(resolve_vault_usd(c) for c in CITIES.values())
 
 
 class CityRunner:
@@ -206,6 +216,7 @@ class CityRunner:
             return
 
         self._state["model_probs"] = model_probs
+        self._state["probs_at"]    = scanned_at
         self._state["model_mu"]    = forecast.mu
 
         signals = scan_all_brackets(
@@ -215,15 +226,22 @@ class CityRunner:
             max_edge_magnitude = self.max_edge_magnitude,
         )
         date = self._state.get("market_date", self._local_now().strftime("%Y-%m-%d"))
-        scan_id = self.ledger.log_scan(
-            self.icao, datetime.datetime.utcfromtimestamp(scanned_at).isoformat(), date,
-            forecast, trailing_bias, model_probs,
-        )
+        scan_iso = datetime.datetime.utcfromtimestamp(scanned_at).isoformat()
+        scan_id = self.ledger.log_scan(self.icao, scan_iso, date, forecast, trailing_bias, model_probs)
         for sig in signals.values():
             sig.market_date, sig.scanned_at, sig.scan_id = date, scanned_at, scan_id
+            sig.edge_state = None
             if sig.market_price and (sig.market_price.bids or sig.market_price.asks):  # Gamma prices carry no book
                 p = sig.market_price
-                self.ledger.log_book(scan_id, p.token_id, "scan", p.bids, p.asks, p.fetched_at)
+                self.ledger.log_book(scan_id, p.token_id, "scan", p.bids, p.asks, p.fetched_at,
+                                     bracket=sig.bracket_label)
+            if sig.market_price is not None:
+                # P5: only a persistent, non-decaying edge may trade (see core/edge_state.py).
+                history = self.ledger.edge_history(self.icao, date, sig.bracket_label)
+                sig.edge_state = edge_lifecycle(history + [(scan_iso, sig.edge)], self.edge_threshold)
+                if sig.actionable and sig.edge_state.state != ACTIONABLE:
+                    sig.actionable = False
+                    sig.gate_reason = f"EDGE_{sig.edge_state.state}"
         self._state["signals"] = signals
 
         # Log ALL signals to DB — including non-actionable, gated, and held —
@@ -239,6 +257,7 @@ class CityRunner:
                 action        = sig.action_label,
                 icao          = self.icao,
                 scan_id       = scan_id,
+                edge_state    = sig.edge_state.state if sig.edge_state else "",
             )
 
         buys  = [l for l, s in signals.items() if s.direction == "BUY"  and s.actionable]
@@ -273,6 +292,7 @@ class CityRunner:
             logger.info(f"[JOB3:{self.icao}] No actionable signals this cycle.")
             return
 
+        switches = self._kill_switches()
         trailing_bias = self.ledger.fetch_trailing_bias(self.icao)
         engine        = ExecutionEngine(
             self.client, self.ledger, self.vault_usd, self.icao,
@@ -315,20 +335,66 @@ class CityRunner:
                 )
                 logger.info(f"[JOB3:{self.icao}] {label} [{direction}]: {sizing}")
 
-            if sizing.verdict == "EXECUTE":
-                market_date_for_entry = self._state.get(
-                    "market_date", self._local_now().strftime("%Y-%m-%d")
+            market_date_for_entry = self._state.get(
+                "market_date", self._local_now().strftime("%Y-%m-%d")
+            )
+            decision = self._decide(signal, direction, win_prob, sizing, market_date_for_entry, switches)
+            if decision.action != ENTER:
+                logger.info(f"[JOB3:{self.icao}] {decision.action} {label} [{direction}]: "
+                            f"{', '.join(decision.reasons)} (sizing: {sizing.reason})")
+                continue
+            sizing.size_usd = decision.quantities["final"]
+            filled = engine.execute(signal, sizing, market_date=market_date_for_entry)
+            if filled:
+                logger.info(
+                    f"[JOB3:{self.icao}] ✓ Position opened: {label} "
+                    f"{'YES' if direction == 'BUY' else 'NO'} ${sizing.size_usd:.2f} "
+                    f"(expected VWAP {decision.expected['vwap']:.4f})"
                 )
-                filled = engine.execute(signal, sizing, market_date=market_date_for_entry)
-                if filled:
-                    logger.info(
-                        f"[JOB3:{self.icao}] ✓ Position opened: {label} "
-                        f"{'YES' if direction == 'BUY' else 'NO'} ${sizing.size_usd:.2f}"
-                    )
-                else:
-                    logger.warning(f"[JOB3:{self.icao}] ✗ Execution failed or rejected: {label} [{direction}]")
             else:
-                logger.info(f"[JOB3:{self.icao}] Sizing HOLD for {label} [{direction}]: {sizing.reason}")
+                logger.warning(f"[JOB3:{self.icao}] ✗ Execution failed or rejected: {label} [{direction}]")
+
+    def _decide(self, signal, direction, win_prob, sizing, market_date, switches=()):
+        """Assemble the P8 decision inputs from live state, decide, and log the snapshot."""
+        token = signal.token_id if direction == "BUY" else signal.no_token_id
+        try:
+            asks = book_levels(self.client.get_order_book(token), "asks") if token else []
+        except Exception as e:  # no book → no executable edge, decided and logged as such
+            logger.warning(f"[JOB3:{self.icao}] {signal.bracket_label}: order book fetch failed: {e}")
+            asks = []
+        edge_state = getattr(signal, "edge_state", None)
+        inputs = DecisionInputs(
+            icao=self.icao, market_date=market_date, bracket=signal.bracket_label,
+            direction=direction, scan_id=getattr(signal, "scan_id", None), win_prob=win_prob,
+            edge_threshold=self.edge_threshold,
+            edge_state=edge_state.state if edge_state else "NO_EDGE",
+            freshness=signal_freshness(signal, market_date),
+            settlement_valid=bool(self._state.get("token_matrix")),
+            position_open=bool(token) and self.ledger.is_position_open(token),
+            q_kelly=sizing.size_usd if sizing.verdict == "EXECUTE" else 0.0,
+            limits=position_limits(self.ledger.get_open_positions(), self.icao, market_date,
+                                   signal.bracket_label, direction, self.vault_usd, _all_vaults_usd()),
+            asks=asks, kill_switches=list(switches),
+        )
+        decision = decide(inputs)
+        self.ledger.log_decision(snapshot(inputs, decision))
+        return decision
+
+    def _tripped(self):
+        market_date = self._state.get("market_date") or self._local_now().strftime("%Y-%m-%d")
+        found = tripped(self.ledger, self.icao, self.vault_usd, market_date)
+        for name, flatten in found:
+            logger.critical(f"[KILL:{self.icao}] {name} tripped — "
+                            f"{'flattening positions and ' if flatten else ''}blocking new entries")
+        return found
+
+    def _risk_flatten(self) -> bool:
+        """True when a tripped kill switch requires closing every position (P13)."""
+        return any(flatten for _, flatten in self._tripped())
+
+    def _kill_switches(self) -> list:
+        """Names of tripped kill switches; any one blocks new entries (P13)."""
+        return [name for name, _ in self._tripped()]
 
     # ══════════════════════════════════════════════════════════════════════
     # JOB 4 — Settlement Check (every 15 min, 24/7 — checks today AND yesterday)
@@ -384,10 +450,12 @@ class CityRunner:
             logger.info(f"[JOB5:{self.icao}] No open positions.")
             return
 
+        # Stops and the time exit must run even before Job 2 has produced
+        # probabilities (e.g. right after a restart); only model exits need them.
         model_probs = self._state.get("model_probs", {})
+        probs_at = self._state.get("probs_at")
         if not model_probs:
-            logger.warning(f"[JOB5:{self.icao}] No model probs in state — Job 2 may not have run yet.")
-            return
+            logger.warning(f"[JOB5:{self.icao}] No model probs yet — stops/time exits only this cycle.")
 
         monitor = PositionMonitor(
             client         = self.client,
@@ -399,7 +467,11 @@ class CityRunner:
             timezone       = self.config.timezone,
         )
         market_date = self._state.get("market_date", self._local_now().strftime("%Y-%m-%d"))
-        results = monitor.run(model_probs, market_date=market_date)
+        results = monitor.run(
+            model_probs, market_date=market_date,
+            probs_age_s=time.time() - probs_at if probs_at else None,
+            risk_flatten=self._risk_flatten(),
+        )
 
         exits_filled = [r for r in results if r["filled"]]
         exits_failed = [r for r in results if not r["filled"]]
