@@ -27,6 +27,9 @@ Baselines on the same days:
     2016-2023, strictly before every scored day
   - market: Polymarket prices at the decision time (A: price history API on
     days with an event; B: the mids the bot logged), normalised
+  - market blend: (1-w)*market + w*model, w chosen leave-one-date-out; a
+    blend beating the market means the model adds information, even when
+    it loses to the market head-to-head
 
 Raw downloads are cached under .cache/calibration/ so reruns are offline.
 
@@ -409,6 +412,41 @@ def compare(rows: List[dict], base: str) -> Optional[tuple]:
     return sum(diffs) / len(diffs), lo, hi, len(scored)
 
 
+BLEND_WEIGHTS = [i / 10 for i in range(11)]
+
+
+def blend_brier(row: dict, w: float) -> float:
+    return brier([(1 - w) * m + w * x for m, x in zip(row["market"], row["model"])], row["outcome"])
+
+
+def blend_lines(rows: List[dict]) -> List[str]:
+    """
+    Does the model add information the market lacks? Score (1-w)*market +
+    w*model over w. Losing to the market head-to-head doesn't rule out edge:
+    a best w above zero means disagreements carry signal, and w sizes how
+    much to trust the model against the price. The out-of-sample diff picks
+    w on every other date (leave-one-date-out), so tuning w can't flatter it.
+    """
+    rows = [r for r in rows if r.get("market")]
+    if len(rows) < MIN_VERDICT_DAYS:
+        return [f"  blend: INSUFFICIENT DATA — {len(rows)} days with prices (< {MIN_VERDICT_DAYS})"]
+    dates = sorted({r["date"] for r in rows})
+    totals = {d: [sum(blend_brier(r, w) for r in rows if r["date"] == d) for w in BLEND_WEIGHTS] for d in dates}
+    overall = [sum(t[i] for t in totals.values()) for i in range(len(BLEND_WEIGHTS))]
+    best_w = {d: BLEND_WEIGHTS[min(range(len(BLEND_WEIGHTS)), key=lambda i: overall[i] - totals[d][i])]
+              for d in dates}
+    diffs = [blend_brier(r, best_w[r["date"]]) - brier(r["market"], r["outcome"]) for r in rows]
+    lo, hi = bootstrap_ci(diffs, [r["date"] for r in rows])
+    w_star = BLEND_WEIGHTS[overall.index(min(overall))]
+    adds = hi < 0
+    return ["  blend Brier by model weight w: "
+            + "  ".join(f"{w:.1f}={t / len(rows):.4f}" for w, t in zip(BLEND_WEIGHTS, overall)),
+            f"  best w={w_star:.1f}; out-of-sample blend - market Brier diff {sum(diffs) / len(diffs):+.4f}"
+            f"  95% CI [{lo:+.4f}, {hi:+.4f}]  n={len(rows)}",
+            "  -> model ADDS information to the market: trade disagreements, trusting the model at weight w"
+            if adds else "  -> no evidence the model adds information to the market"]
+
+
 def reliability(rows: List[dict], source: str) -> List[str]:
     edges = [0, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0001]
     out = []
@@ -483,6 +521,7 @@ def report(proxy: List[dict], live: List[dict]) -> str:
         out.append(f"  model - climatology Brier diff {d:+.4f}  95% CI [{lo:+.4f}, {hi:+.4f}]  n={n}"
                    f"  -> {'beats' if hi < 0 else 'does NOT beat'} climatology")
     out += verdict_lines(priced, "  PROXY vs market (priced days)")
+    out += ["", "Market blend (same-day, priced days):"] + blend_lines(priced)
 
     out += ["", "B. LIVE FORWARD — exact live model from scan_snapshots (same-day)"]
     if live:
@@ -490,6 +529,7 @@ def report(proxy: List[dict], live: List[dict]) -> str:
         out.append(summary_line([r for r in live if r["market"]], "days with logged mids",
                                 ("model", "market", "climatology")))
         out += ["Reliability, live model:"] + reliability(live, "model")
+        out += ["Market blend, live model:"] + blend_lines(live)
     out += verdict_lines(live, "GATE P4 (live model)")
     if _polymarket["missing"]:
         out += ["", f"NOTE: {_polymarket['missing']} Polymarket downloads skipped (blocked) — rerun to complete."]

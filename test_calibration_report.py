@@ -91,6 +91,24 @@ def main():
     assert live[0]["outcome"] == [0, 1] and labels == ["31°C", "32°C"]
     assert "INSUFFICIENT DATA" in cr.verdict_lines(live, "x")[0]
 
+    # Blend: a model carrying information the market lacks is detected
+    # out of sample; one that is pure noise is not.
+    import random
+    rng = random.Random(1)
+    informed, noise = [], []
+    for i in range(60):
+        outcome = [0, 0, 0]
+        outcome[rng.randrange(3)] = 1
+        market = [1 / 3] * 3
+        date = f"2026-{1 + i // 28:02d}-{1 + i % 28:02d}"
+        informed.append({"date": date, "outcome": outcome, "market": market,
+                         "model": [0.6 if o else 0.2 for o in outcome]})
+        noise.append({"date": date, "outcome": outcome, "market": [0.7 if o else 0.15 for o in outcome],
+                      "model": cr.normalise([rng.random() for _ in range(3)])})
+    assert "ADDS information" in cr.blend_lines(informed)[2]
+    assert "best w=0.0" in cr.blend_lines(noise)[1] and "no evidence" in cr.blend_lines(noise)[2]
+    assert "INSUFFICIENT" in cr.blend_lines(informed[:5])[0]
+
     # Breaker: one failure is skipped, MAX_CONSECUTIVE_FAILURES in a row stop downloads.
     def fail():
         raise cr.requests.ConnectionError("flaky")
